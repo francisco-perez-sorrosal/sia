@@ -54,11 +54,13 @@ import sys
 import time
 import traceback
 import venv
+from dataclasses import dataclass
 from datetime import datetime
 from importlib.resources import files as resource_files
 from pathlib import Path
 
 from sia import __version__
+from sia.config import Config
 from sia.context_manager import ContextManager
 from sia.util import run_agent
 
@@ -136,12 +138,17 @@ def load_agent_execution(gen_directory):
         trajectories = []
         for f in files:
             try:
+                file_size = os.path.getsize(f)
+                if file_size > Config.MAX_EXECUTION_LOG_SIZE:
+                    logger.warning(f"Skipping oversized trajectory ({file_size:,} bytes): {os.path.basename(f)}")
+                    trajectories.append({"error": "File too large", "file": os.path.basename(f), "size": file_size})
+                    continue
                 with open(f, encoding="utf-8") as fp:
                     trajectories.append(json.load(fp))
             except json.JSONDecodeError as e:
                 logger.warning(f"  ✗ Failed to parse {os.path.basename(f)}: {e}")
                 trajectories.append({"error": str(e), "file": os.path.basename(f)})
-            except Exception as e:
+            except (OSError, KeyError) as e:
                 logger.warning(f"  ✗ Error reading {os.path.basename(f)}: {e}")
                 trajectories.append({"error": str(e), "file": os.path.basename(f)})
 
@@ -154,6 +161,10 @@ def load_agent_execution(gen_directory):
         logger.info("  → Detected single-file format")
 
         try:
+            file_size = os.path.getsize(execution_file)
+            if file_size > Config.MAX_EXECUTION_LOG_SIZE:
+                logger.warning(f"Execution log too large ({file_size:,} bytes), skipping")
+                return {"error": "File too large", "size": file_size}, False
             with open(execution_file, encoding="utf-8") as f:
                 data = json.load(f)
             logger.info("  ✓ Successfully loaded agent execution log")
@@ -173,7 +184,7 @@ def load_agent_execution(gen_directory):
                     "parse_error": str(e),
                     "file_size": len(raw),
                 }, False
-            except Exception as read_error:
+            except OSError as read_error:
                 return {"error": "Could not read file", "read_error": str(read_error)}, False
 
         except FileNotFoundError:
@@ -217,13 +228,15 @@ def run_evaluation(gen_directory, task_dir, venv_dir):
     # Run evaluate.py as subprocess with --gen-dir
     try:
         python_exec = os.path.join(venv_dir, "bin", "python")
-        command = f"{python_exec} {evaluate_script} --gen-dir {gen_directory} 2>&1 | tee {eval_log_file}"
-
-        result = subprocess.run(command, shell=True, text=True, executable="/bin/bash")
-
-        # Read evaluation log
-        with open(eval_log_file) as f:
-            eval_output = f.read()
+        result = subprocess.run(
+            [python_exec, evaluate_script, "--gen-dir", gen_directory],
+            capture_output=True,
+            text=True,
+            timeout=Config.EVAL_TIMEOUT,
+        )
+        # Write combined output to log file
+        eval_output = result.stdout + result.stderr
+        Path(eval_log_file).write_text(eval_output, encoding="utf-8")
 
         if result.returncode != 0:
             logger.error(f"  ✗ Evaluation failed with exit code {result.returncode}")
@@ -245,7 +258,7 @@ def run_evaluation(gen_directory, task_dir, venv_dir):
                 with open(results_json_path) as f:
                     results = json.load(f)
                 logger.info(f"    Results: {json.dumps(results, indent=2)}")
-            except Exception:
+            except (json.JSONDecodeError, OSError):
                 pass
 
             return {
@@ -263,7 +276,10 @@ def run_evaluation(gen_directory, task_dir, venv_dir):
                 "output": eval_output,
             }
 
-    except Exception as e:
+    except subprocess.TimeoutExpired:
+        logger.error(f"  ✗ Evaluation timed out after {Config.EVAL_TIMEOUT}s")
+        return {"status": "error", "reason": f"Evaluation timed out after {Config.EVAL_TIMEOUT}s"}
+    except (subprocess.SubprocessError, OSError) as e:
         logger.error(f"  ✗ Unexpected error during evaluation: {e}")
         logger.error(traceback.format_exc())
         return {"status": "error", "reason": str(e), "traceback": traceback.format_exc()}
@@ -287,139 +303,128 @@ def _print_welcome():
     print(banner)
 
 
-def main():
-    _print_welcome()
+def _run_target_agent_sandboxed(
+    python_exec: str,
+    target_agent_path: str,
+    dataset_dir: str,
+    working_dir: str,
+    stdout_log_file: str,
+    config: Config,
+) -> int:
+    """Run target agent inside a Docker container for isolation.
 
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Run the orchestrator for agent evolution")
-    parser.add_argument("--max_gen", type=int, default=3, help="Maximum number of generations to run (default: 3)")
-    parser.add_argument("--run_id", type=int, default=1, help="Run ID for this experiment (default: 1)")
-    task_group = parser.add_mutually_exclusive_group(required=True)
-    task_group.add_argument(
-        "--task",
-        type=str,
-        choices=BUNDLED_TASKS,
-        help=f"Name of a bundled task shipped with sia-agent ({', '.join(BUNDLED_TASKS)})",
-    )
-    task_group.add_argument(
-        "--task_dir",
-        type=str,
-        help="Path to an external task directory (e.g., ./tasks/my-task)",
-    )
-    parser.add_argument(
-        "--meta_model",
-        type=str,
-        default=None,
-        help="Model to use for meta-agent (default: haiku for claude backend, gemini/gemini-3.1-pro-preview for openhands backend)",
-    )
-    parser.add_argument(
-        "--task_model",
-        type=str,
-        default="claude-haiku-4-5-20251001",
-        help="Model to use for target agent (default: claude-haiku-4-5-20251001)",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default="claude",
-        choices=["claude", "openhands"],
-        help="Agent backend to use: claude (Claude Code SDK) or openhands (OpenHands SDK) (default: claude)",
-    )
-    args = parser.parse_args()
+    Mounts dataset_dir as read-only and working_dir as read-write.
+    Network access is disabled.
+    """
+    docker_cmd = [
+        "docker", "run", "--rm",
+        "--network", "none",
+        "--memory", config.DOCKER_MEMORY_LIMIT,
+        f"--cpus={config.DOCKER_CPU_LIMIT}",
+        "-v", f"{dataset_dir}:/data:ro",
+        "-v", f"{working_dir}:/work:rw",
+        config.DOCKER_IMAGE,
+        "python", "-u", "/work/target_agent.py",
+        "--dataset_dir", "/data",
+        "--working_dir", "/work",
+    ]
 
-    max_gen = args.max_gen
-    task_dir, shared_dir = resolve_task_dir(args.task, args.task_dir)
-    run_id = args.run_id
-    backend = args.backend
+    with open(stdout_log_file, "w", encoding="utf-8") as log_fh:
+        process = subprocess.Popen(
+            docker_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for line in process.stdout:
+            print(line, end="")
+            log_fh.write(line)
+        return process.wait()
 
-    # Set default meta_model based on backend if not explicitly provided
-    if args.meta_model is None:
-        if backend == "openhands":
-            meta_model = "gemini/gemini-3.1-pro-preview"
-            logger.info("Using default OpenHands model: gemini/gemini-3.1-pro-preview")
-        else:
-            meta_model = "haiku"
-            logger.info("Using default Claude model: haiku")
-    else:
-        meta_model = args.meta_model
 
-    task_model = args.task_model
+@dataclass
+class TaskFiles:
+    """Container for task reference files loaded from disk."""
+    sample_task_descriptions: str
+    reference_target_agent_py: str
+    sample_agent_execution: dict
+    task_md: str
 
-    logger.info("Configuration:")
-    logger.info(f"  - Maximum generations: {max_gen}")
-    logger.info(f"  - Task directory: {task_dir}")
-    logger.info(f"  - Run ID: {run_id}")
-    logger.info(f"  - Agent backend: {backend}")
-    logger.info(f"  - Meta-agent model: {meta_model}")
-    logger.info(f"  - Task-agent model: {task_model}")
 
-    # ========================
-    # SECTION 1: Load Files from Task Directory
-    # ========================
-
+def load_task_files(task_dir: str, shared_dir: str) -> TaskFiles:
+    """Load all reference files from the task directory."""
     logger.info("Loading files from task directory...")
 
-    SAMPLE_TASK_DESCRIPTIONS = Path(task_dir, "reference/SAMPLE_TASK_DESCRIPTIONS.md").read_text()
+    sample_task_descriptions = Path(task_dir, "reference/SAMPLE_TASK_DESCRIPTIONS.md").read_text()
     logger.info("  ✓ Sample task descriptions loaded")
 
-    REFERENCE_TARGET_AGENT_PY = Path(task_dir, "reference/reference_target_agent.py").read_text()
+    reference_target_agent_py = Path(task_dir, "reference/reference_target_agent.py").read_text()
     logger.info("  ✓ Reference target agent loaded")
 
     with open(os.path.join(shared_dir, "sample_agent_execution.json")) as f:
-        SAMPLE_AGENT_EXECUTION = json.load(f)
+        sample_agent_execution = json.load(f)
     logger.info("  ✓ Sample agent execution loaded")
 
-    TASK_MD = Path(task_dir, "data/public/task.md").read_text()
+    task_md = Path(task_dir, "data/public/task.md").read_text()
     logger.info("  ✓ Task specification loaded")
 
-    # ========================
-    # SECTION 2: Setup Run Directories
-    # ========================
+    return TaskFiles(
+        sample_task_descriptions=sample_task_descriptions,
+        reference_target_agent_py=reference_target_agent_py,
+        sample_agent_execution=sample_agent_execution,
+        task_md=task_md,
+    )
 
-    gen_num = 1
-    RUN_DIRECTORY = f"./runs/run_{run_id}"
-    META_AGENT_WORKING_DIRECTORY = os.path.abspath(f"{RUN_DIRECTORY}/gen_{gen_num}")
-    # Create run directory and meta_agent working directory
-    if os.path.exists(RUN_DIRECTORY):
-        logger.error(f"Run directory already exists: {RUN_DIRECTORY}")
-        logger.error("Please use a different run_id or remove the existing directory")
-        sys.exit(1)
 
-    logger.info(f"Creating run directory: {RUN_DIRECTORY}")
-    os.makedirs(RUN_DIRECTORY, exist_ok=False)
+@dataclass
+class RunSetup:
+    """Container for run directory paths and managers."""
+    run_directory: str
+    meta_agent_working_directory: str
+    venv_dir: str
+    context_mgr: ContextManager
 
-    logger.info(f"Creating meta_agent working directory: {META_AGENT_WORKING_DIRECTORY}")
-    os.makedirs(META_AGENT_WORKING_DIRECTORY, exist_ok=False)
 
-    # Create virtual environment
-    venv_dir = os.path.join(RUN_DIRECTORY, "venv")
-    logger.info(f"Creating virtual environment at: {venv_dir}")
-
-    packages = [
-        "anthropic",
-        "openai",
-        "python-dotenv",
-        "google-genai",
-        "tqdm",
-        "pydantic",
-        "scikit-learn",
-        "pandas",
-        "numpy",
-    ]
-
+def _create_venv(venv_dir: str, packages: list[str]) -> None:
+    """Create a virtual environment and install packages."""
     if shutil.which("uv"):
         subprocess.run(["uv", "venv", venv_dir], check=True)
         subprocess.run(
-            ["uv", "pip", "install", "--python", os.path.join(venv_dir, "bin", "python"), *packages], check=True
+            ["uv", "pip", "install", "--python", os.path.join(venv_dir, "bin", "python"), *packages],
+            check=True,
         )
     else:
         venv.create(venv_dir, with_pip=True)
         subprocess.run([os.path.join(venv_dir, "bin", "pip"), "install", *packages], check=True)
 
-    # Initialize Context Manager
+
+def setup_run_directory(
+    run_id: int, task_dir: str, meta_model: str, task_model: str,
+    backend: str, max_gen: int,
+) -> RunSetup:
+    """Create run directories, venv, and context manager."""
+    gen_num = 1
+    run_directory = f"./runs/run_{run_id}"
+    meta_agent_working_directory = os.path.abspath(f"{run_directory}/gen_{gen_num}")
+
+    if os.path.exists(run_directory):
+        logger.error(f"Run directory already exists: {run_directory}")
+        logger.error("Please use a different run_id or remove the existing directory")
+        sys.exit(1)
+
+    logger.info(f"Creating run directory: {run_directory}")
+    os.makedirs(run_directory, exist_ok=False)
+
+    logger.info(f"Creating meta_agent working directory: {meta_agent_working_directory}")
+    os.makedirs(meta_agent_working_directory, exist_ok=False)
+
+    venv_dir = os.path.join(run_directory, "venv")
+    logger.info(f"Creating virtual environment at: {venv_dir}")
+    _create_venv(venv_dir, Config.VENV_PACKAGES)
+
     logger.info("Initializing context manager...")
     context_mgr = ContextManager(
-        RUN_DIRECTORY,
+        run_directory,
         {
             "task_dir": task_dir,
             "meta_model": meta_model,
@@ -431,27 +436,35 @@ def main():
     context_mgr.initialize()
     logger.info("  ✓ Context manager initialized")
 
-    # ========================
-    # SECTION 3: Define Prompts
-    # ========================
+    return RunSetup(
+        run_directory=run_directory,
+        meta_agent_working_directory=meta_agent_working_directory,
+        venv_dir=venv_dir,
+        context_mgr=context_mgr,
+    )
 
-    META_AGENT_PROMPT = f"""You are a meta-agent. Your task is to create a target agent which can execute a task. Go ahead and create a target_agent.py for the target agent, which in turn can solve the given task.
+
+def build_meta_prompt(
+    task_files: TaskFiles, task_model: str, working_dir: str,
+) -> str:
+    """Build the meta-agent prompt for creating the initial target agent."""
+    return f"""You are a meta-agent. Your task is to create a target agent which can execute a task. Go ahead and create a target_agent.py for the target agent, which in turn can solve the given task.
 
 Here is the FULL TASK SPECIFICATION that your target_agent.py will need to solve:
-{TASK_MD}
+{task_files.task_md}
 
 Here are a couple of sample task descriptions which the target agent has to solve:
-{SAMPLE_TASK_DESCRIPTIONS}
+{task_files.sample_task_descriptions}
 
 Here is a sample target_agent.py showing the complete implementation pattern (READ THE ENTIRE FILE):
-{REFERENCE_TARGET_AGENT_PY}
+{task_files.reference_target_agent_py}
 
 Here is a sample agent execution trajectory:
-{json.dumps(SAMPLE_AGENT_EXECUTION, indent=2)}
+{json.dumps(task_files.sample_agent_execution, indent=2)}
 
 CRITICAL RULES - FOLLOW EXACTLY:
 
-1. The current working directory is {META_AGENT_WORKING_DIRECTORY}. Create the target_agent.py in the current working directory itself.
+1. The current working directory is {working_dir}. Create the target_agent.py in the current working directory itself.
 
 2. The target_agent.py MUST accept two command-line arguments:
    - --dataset_dir: Absolute path to the dataset directory (READ-ONLY, provided at runtime)
@@ -502,15 +515,358 @@ Example invocation (paths will vary at runtime):
     python target_agent.py --dataset_dir /path/to/dataset --working_dir /path/to/working
 """
 
-    FEEDBACK_AGENT_PROMPT = """You are an expert AI Engineer analyzing agent scaffolds for iterative improvement.
+
+def _run_target_agent(
+    venv_dir: str, target_agent_path: str,
+    abs_dataset_dir: str, gen_dir: str,
+    stdout_log_file: str, sandbox: str, env_config: Config,
+) -> tuple[bool, str, str, str]:
+    """Run the target agent subprocess.
+
+    Returns (success, stdout, stderr, error_msg).
+    """
+    python_exec = os.path.join(venv_dir, "bin", "python")
+    return_code = 0
+    target_agent_stdout = ""
+    target_agent_stderr = ""
+    target_agent_error_msg = ""
+
+    try:
+        if sandbox == "docker":
+            return_code = _run_target_agent_sandboxed(
+                python_exec=python_exec,
+                target_agent_path=target_agent_path,
+                dataset_dir=abs_dataset_dir,
+                working_dir=gen_dir,
+                stdout_log_file=stdout_log_file,
+                config=env_config,
+            )
+        else:
+            with open(stdout_log_file, "w", encoding="utf-8") as log_fh:
+                process = subprocess.Popen(
+                    [python_exec, "-u", target_agent_path,
+                     "--dataset_dir", abs_dataset_dir,
+                     "--working_dir", gen_dir],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                for line in process.stdout:
+                    print(line, end="")
+                    log_fh.write(line)
+                return_code = process.wait()
+
+        with open(stdout_log_file, encoding="utf-8") as f:
+            target_agent_stdout = f.read()
+
+        logger.info("=" * 60)
+
+        if return_code != 0:
+            target_agent_error_msg = f"Target agent failed with exit code {return_code}"
+            logger.error(f"  ✗ Target agent execution failed with exit code {return_code}")
+            logger.warning("  → Continuing with feedback agent despite target agent failure")
+            return False, target_agent_stdout, target_agent_stderr, target_agent_error_msg
+        else:
+            logger.info("  ✓ Target agent execution completed successfully")
+            return True, target_agent_stdout, target_agent_stderr, target_agent_error_msg
+
+    except FileNotFoundError:
+        logger.error(f"  ✗ Target agent file not found: {target_agent_path}")
+        logger.error("  → Cannot continue.")
+        return False, "", "", f"Target agent file not found: {target_agent_path}"
+    except Exception as e:
+        target_agent_error_msg = f"Unexpected error during target agent execution: {e!s}"
+        logger.exception(f"  ✗ {target_agent_error_msg}")
+        logger.warning("  → Continuing with feedback agent despite target agent failure")
+        try:
+            with open(stdout_log_file, encoding="utf-8") as f:
+                target_agent_stdout = f.read()
+        except OSError:
+            pass
+        return False, target_agent_stdout, target_agent_stderr, target_agent_error_msg
+
+
+def _build_feedback_context(
+    current_gen: int, gen_dir: str, dataset_dir: str,
+    target_agent_success: bool, target_agent_error_msg: str,
+    target_agent_stdout: str, target_agent_stderr: str,
+    stdout_log_file: str, task_files: TaskFiles,
+) -> tuple[str, str]:
+    """Build execution status and section for feedback prompt.
+
+    Returns (execution_status, execution_section).
+    """
+    # Load execution log
+    agent_execution, is_multi_trajectory = load_agent_execution(gen_dir)
+
+    if is_multi_trajectory:
+        trajectory_count = agent_execution.get("count", 0)
+        trajectories = agent_execution.get("trajectories", [])
+
+        successful = sum(1 for t in trajectories if isinstance(t, list))
+        failed = sum(1 for t in trajectories if isinstance(t, dict) and t.get("error"))
+
+        sample_trajectories_text = ""
+        for idx, traj in enumerate(trajectories[:3]):
+            traj_json = json.dumps(traj, indent=2)
+            if len(traj_json) > Config.TRAJECTORY_PREVIEW_LIMIT:
+                traj_json = traj_json[:Config.TRAJECTORY_PREVIEW_LIMIT] + "\n  ... (truncated)"
+            sample_trajectories_text += f"\n### Trajectory {idx}\n```json\n{traj_json}\n```\n"
+
+        execution_section = f"""
+**MULTI-TRAJECTORY EXECUTION**:
+
+The agent executed {trajectory_count} separate trajectories (e.g., different questions/samples).
+
+**Summary**:
+- Total trajectories: {trajectory_count}
+- Successful: {successful}
+- Failed: {failed}
+- Execution folder: {os.path.join(gen_dir, "agent_execution")}
+
+**Sample Trajectories** (first 3 shown, you can read others from the folder):
+{sample_trajectories_text}
+
+**To analyze all trajectories**:
+- Read files from: {os.path.join(gen_dir, "agent_execution")}
+- Files named: execution_q0.json, execution_q1.json, ..., execution_q{trajectory_count - 1}.json
+
+**Analysis guidance**:
+- Look for common failure patterns across trajectories
+- Check if trajectories are properly isolated
+- Ensure consistent behavior across all samples
+"""
+    else:
+        traj_json = json.dumps(agent_execution, indent=2)
+        if len(traj_json) > Config.TRAJECTORY_PREVIEW_LIMIT:
+            traj_json = traj_json[:Config.TRAJECTORY_PREVIEW_LIMIT] + "\n  ... (truncated)"
+        execution_section = f"""
+Here is the target agent execution trajectory:
+```json
+{traj_json}
+```
+
+NOTE: If you see an "error" field in the above JSON, it means the execution log was malformed or missing. Focus on making the agent more robust.
+"""
+
+    # Load evaluation results if available
+    eval_results_section = ""
+    results_json_path = os.path.join(gen_dir, "results.json")
+    if os.path.exists(results_json_path):
+        try:
+            file_size = os.path.getsize(results_json_path)
+            if file_size > Config.MAX_EXECUTION_LOG_SIZE:
+                eval_results_section = f"\n**EVALUATION RESULTS**: results.json too large ({file_size:,} bytes)\n"
+            else:
+                with open(results_json_path, encoding="utf-8") as f:
+                    eval_data = json.load(f)
+                eval_results_section = f"""
+
+**EVALUATION RESULTS**:
+```json
+{json.dumps(eval_data, indent=2)}
+```
+"""
+        except (json.JSONDecodeError, OSError) as e:
+            eval_results_section = f"\n**EVALUATION RESULTS**: Error loading results.json: {e}\n"
+    else:
+        eval_results_section = (
+            "\n**EVALUATION RESULTS**: No results.json found (evaluation may not have run or may have failed)\n"
+        )
+
+    # Build execution status
+    stdout_lines = target_agent_stdout.split("\n")
+    last_10_lines = "\n".join(stdout_lines[-10:]) if len(stdout_lines) > 10 else target_agent_stdout
+
+    if target_agent_success:
+        execution_status = f"""SUCCESS: Target agent completed execution successfully.
+{eval_results_section}
+
+**Last 10 lines of output**:
+```
+{last_10_lines}
+```
+
+Full logs available at: {stdout_log_file}
+"""
+    else:
+        execution_status = f"""FAILED: {target_agent_error_msg}
+{eval_results_section}
+
+**Last 10 lines of output**:
+```
+{last_10_lines}
+```
+
+Full logs available at: {stdout_log_file}
+
+STDERR:
+{target_agent_stderr}
+"""
+
+    return execution_status, execution_section
+
+
+def _run_feedback_agent(
+    current_gen: int, max_gen: int, run_dir: str,
+    next_gen_dir: str, task_files: TaskFiles,
+    execution_status: str, execution_section: str,
+    meta_model: str, backend: str, env_config: Config,
+    dataset_dir: str, stdout_log_file: str,
+) -> None:
+    """Run the feedback agent to create an improved target agent."""
+    agent_py = Path(os.path.join(run_dir, f"gen_{current_gen}"), "target_agent.py").read_text(encoding="utf-8")
+    task = Path(dataset_dir, "task.md").read_text(encoding="utf-8")
+
+    previous_gens_list = list(range(1, current_gen)) if current_gen > 1 else []
+    previous_gens_text = ", ".join(map(str, previous_gens_list)) if previous_gens_list else "None"
+
+    feedback_agent_prompt = build_feedback_prompt(
+        current_gen=current_gen,
+        max_gen=max_gen,
+        task_files=task_files,
+        agent_py=agent_py,
+        task=task,
+        execution_status=execution_status,
+        execution_section=execution_section,
+        run_dir=run_dir,
+        next_gen_dir=next_gen_dir,
+        previous_gens=previous_gens_text,
+        stdout_log_file=stdout_log_file,
+    )
+
+    os.makedirs(next_gen_dir, exist_ok=True)
+
+    feedback_prompt_path = os.path.join(next_gen_dir, "feedback_agent_prompt.txt")
+    with open(feedback_prompt_path, "w", encoding="utf-8") as f:
+        f.write(feedback_agent_prompt)
+    logger.info(f"  ✓ Saved feedback agent prompt to: {feedback_prompt_path}")
+
+    asyncio.run(
+        run_agent(
+            model_name=meta_model,
+            max_turns=str(Config.DEFAULT_MAX_TURNS),
+            prompt=feedback_agent_prompt,
+            agent_working_directory=next_gen_dir,
+            backend=backend,
+        )
+    )
+
+    next_gen = current_gen + 1
+    logger.info(f"Feedback agent completed. Created improved agent for generation {next_gen}")
+
+
+def run_generation(
+    current_gen: int, max_gen: int,
+    run_setup: RunSetup, task_files: TaskFiles,
+    abs_dataset_dir: str, dataset_dir: str,
+    meta_model: str, backend: str, sandbox: str,
+    env_config: Config,
+) -> None:
+    """Execute one generation: run target agent, evaluate, optionally run feedback agent."""
+    run_dir = run_setup.run_directory
+    gen_dir = os.path.abspath(f"{run_dir}/gen_{current_gen}")
+    target_agent_path = os.path.join(gen_dir, "target_agent.py")
+    stdout_log_file = os.path.join(gen_dir, "target_agent_stdout.log")
+
+    logger.info(f"Running target agent: {target_agent_path}")
+    logger.info(f"  → Stdout log: {stdout_log_file}")
+    logger.info("=" * 60)
+
+    generation_start_time = time.time()
+
+    # Run target agent
+    target_agent_success, target_agent_stdout, target_agent_stderr, target_agent_error_msg = _run_target_agent(
+        venv_dir=run_setup.venv_dir,
+        target_agent_path=target_agent_path,
+        abs_dataset_dir=abs_dataset_dir,
+        gen_dir=gen_dir,
+        stdout_log_file=stdout_log_file,
+        sandbox=sandbox,
+        env_config=env_config,
+    )
+
+    generation_duration = time.time() - generation_start_time
+
+    # Run evaluation (if evaluate.py exists)
+    logger.info("=" * 60)
+    logger.info("Running evaluation (if available)...")
+    run_evaluation(gen_dir, dataset_dir, run_setup.venv_dir)
+    logger.info("=" * 60)
+
+    # Add generation to context
+    improvement_md_path = os.path.join(gen_dir, "improvement.md")
+    run_setup.context_mgr.add_generation(
+        gen_num=current_gen,
+        gen_data={
+            "success": target_agent_success,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration": generation_duration,
+            "agent_path": target_agent_path,
+            "gen_dir": gen_dir,
+            "improvement_path": improvement_md_path if os.path.exists(improvement_md_path) else None,
+            "execution_type": "Multi-trajectory"
+            if (os.path.isdir(os.path.join(gen_dir, "agent_execution")))
+            else "Single",
+        },
+    )
+
+    # Run feedback agent (if not the last generation)
+    if current_gen < max_gen:
+        logger.info(f"Running feedback agent for generation {current_gen}")
+        logger.info("Loading agent execution log...")
+
+        execution_status, execution_section = _build_feedback_context(
+            current_gen=current_gen,
+            gen_dir=gen_dir,
+            dataset_dir=dataset_dir,
+            target_agent_success=target_agent_success,
+            target_agent_error_msg=target_agent_error_msg,
+            target_agent_stdout=target_agent_stdout,
+            target_agent_stderr=target_agent_stderr,
+            stdout_log_file=stdout_log_file,
+            task_files=task_files,
+        )
+
+        next_gen = current_gen + 1
+        next_gen_directory = os.path.abspath(f"{run_dir}/gen_{next_gen}")
+
+        _run_feedback_agent(
+            current_gen=current_gen,
+            max_gen=max_gen,
+            run_dir=run_dir,
+            next_gen_dir=next_gen_directory,
+            task_files=task_files,
+            execution_status=execution_status,
+            execution_section=execution_section,
+            meta_model=meta_model,
+            backend=backend,
+            env_config=env_config,
+            dataset_dir=dataset_dir,
+            stdout_log_file=stdout_log_file,
+        )
+    else:
+        logger.info(f"Generation {current_gen} is the final generation. Skipping feedback agent.")
+
+
+def build_feedback_prompt(
+    current_gen: int, max_gen: int, task_files: TaskFiles,
+    agent_py: str, task: str, execution_status: str,
+    execution_section: str, run_dir: str, next_gen_dir: str,
+    previous_gens: str, stdout_log_file: str,
+) -> str:
+    """Build the feedback agent prompt for improving the target agent."""
+    context_md_path = os.path.join(run_dir, "context.md")
+
+    return f"""You are an expert AI Engineer analyzing agent scaffolds for iterative improvement.
 
 **GENERATION CONTEXT**:
-- Current generation: {CURRENT_GEN}
-- Previous generations: {PREVIOUS_GENS}
-- Evolution history: {CONTEXT_MD_PATH}
+- Current generation: {current_gen}
+- Previous generations: {previous_gens}
+- Evolution history: {context_md_path}
 
 **BEFORE ANALYZING - READ THE FULL HISTORY**:
-1. Read {CONTEXT_MD_PATH} to understand:
+1. Read {context_md_path} to understand:
    - What improvements were tried in each previous generation
    - Performance trends across generations
    - What worked and what didn't work
@@ -522,32 +878,32 @@ Example invocation (paths will vary at runtime):
 
 **SAMPLE TASK DESCRIPTIONS**:
 ```
-{SAMPLE_TASK_DESCRIPTIONS}
+{task_files.sample_task_descriptions}
 ```
 
-**CURRENT TARGET AGENT** (Generation {CURRENT_GEN}):
+**CURRENT TARGET AGENT** (Generation {current_gen}):
 ```python
-{AGENT_PY}
+{agent_py}
 ```
 
 **TASK WORKED ON**:
 ```
-{TASK}
+{task}
 ```
 
 **EXECUTION STATUS**:
 ```
-{EXECUTION_STATUS}
+{execution_status}
 ```
 
 **EXECUTION LOGS**:
-{EXECUTION_SECTION}
+{execution_section}
 
 ---
 
 **YOUR TASK**:
 
-You must create exactly TWO files in {IMPROVEMENT_DIR}/:
+You must create exactly TWO files in {next_gen_dir}/:
 1. improvement.md - Analysis and improvement plan
 2. target_agent.py - The improved agent implementation
 
@@ -566,7 +922,7 @@ Follow these steps:
    - Avoid repeating failed approaches
 
 **STEP 3: Write improvement.md**:
-   - MUST save to: {IMPROVEMENT_DIR}/improvement.md
+   - MUST save to: {next_gen_dir}/improvement.md
    - Document your analysis and planned improvements
    - Focus on structural improvements to the agent scaffold
    - Make the agent more robust and generalizable
@@ -574,7 +930,7 @@ Follow these steps:
    - Reference insights from previous generations if applicable
 
 **STEP 4: Create improved target_agent.py**:
-   - MUST save to: {IMPROVEMENT_DIR}/target_agent.py
+   - MUST save to: {next_gen_dir}/target_agent.py
    - Implement the improvements documented in improvement.md
    - Apply all the planned improvements from step 3
    - Do not create or modify any other files besides these two
@@ -591,22 +947,117 @@ Follow these steps:
 NOTE: The agent execution log may be incomplete or contain errors if the target agent crashed. If you see an "error" field, focus on making the agent more robust to prevent such failures.
 """
 
+
+def main():
+    _print_welcome()
+
+    # Load env-var overrides (lower priority than explicit CLI flags)
+    env_config = Config.from_env()
+
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Run the orchestrator for agent evolution")
+    parser.add_argument("--max_gen", type=int, default=env_config.DEFAULT_MAX_GENERATIONS, help="Maximum number of generations to run (default: 3)")
+    parser.add_argument("--run_id", type=int, default=1, help="Run ID for this experiment (default: 1)")
+    task_group = parser.add_mutually_exclusive_group(required=True)
+    task_group.add_argument(
+        "--task",
+        type=str,
+        choices=BUNDLED_TASKS,
+        help=f"Name of a bundled task shipped with sia-agent ({', '.join(BUNDLED_TASKS)})",
+    )
+    task_group.add_argument(
+        "--task_dir",
+        type=str,
+        help="Path to an external task directory (e.g., ./tasks/my-task)",
+    )
+    parser.add_argument(
+        "--meta_model",
+        type=str,
+        default=None,
+        help="Model to use for meta-agent (default: haiku for claude backend, gemini/gemini-3.1-pro-preview for openhands backend)",
+    )
+    parser.add_argument(
+        "--task_model",
+        type=str,
+        default=env_config.DEFAULT_TASK_MODEL,
+        help="Model to use for target agent (default: claude-haiku-4-5-20251001)",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default=env_config.DEFAULT_BACKEND,
+        choices=["claude", "openhands"],
+        help="Agent backend to use: claude (Claude Code SDK) or openhands (OpenHands SDK) (default: claude)",
+    )
+    parser.add_argument(
+        "--sandbox",
+        type=str,
+        default=env_config.SANDBOX_MODE,
+        choices=["none", "docker"],
+        help="Sandbox mode for target agent execution: none (default) or docker (requires Docker)",
+    )
+    args = parser.parse_args()
+
+    max_gen = args.max_gen
+    task_dir, shared_dir = resolve_task_dir(args.task, args.task_dir)
+    run_id = args.run_id
+    backend = args.backend
+
+    # Set default meta_model based on backend if not explicitly provided
+    if args.meta_model is None:
+        if backend == "openhands":
+            meta_model = env_config.DEFAULT_OPENHANDS_META_MODEL
+            logger.info(f"Using default OpenHands model: {env_config.DEFAULT_OPENHANDS_META_MODEL}")
+        else:
+            meta_model = env_config.DEFAULT_CLAUDE_META_MODEL
+            logger.info(f"Using default Claude model: {env_config.DEFAULT_CLAUDE_META_MODEL}")
+    else:
+        meta_model = args.meta_model
+
+    task_model = args.task_model
+
+    logger.info("Configuration:")
+    logger.info(f"  - Maximum generations: {max_gen}")
+    logger.info(f"  - Task directory: {task_dir}")
+    logger.info(f"  - Run ID: {run_id}")
+    logger.info(f"  - Agent backend: {backend}")
+    logger.info(f"  - Meta-agent model: {meta_model}")
+    logger.info(f"  - Task-agent model: {task_model}")
+
+    # ========================
+    # SECTION 1: Load Files from Task Directory
+    # ========================
+
+    task_files = load_task_files(task_dir, shared_dir)
+
+    # ========================
+    # SECTION 2: Setup Run Directories
+    # ========================
+
+    run_setup = setup_run_directory(run_id, task_dir, meta_model, task_model, backend, max_gen)
+
+    # ========================
+    # SECTION 3: Build Initial Prompt
+    # ========================
+
+    meta_agent_prompt = build_meta_prompt(task_files, task_model, run_setup.meta_agent_working_directory)
+
     # ========================
     # SECTION 4: Run Target Agent Creation (Meta-Agent)
     # ========================
 
     # Save the meta-agent prompt for debugging/transparency
-    meta_agent_prompt_path = os.path.join(META_AGENT_WORKING_DIRECTORY, "meta_agent_prompt.txt")
+    meta_agent_prompt_path = os.path.join(run_setup.meta_agent_working_directory, "meta_agent_prompt.txt")
     with open(meta_agent_prompt_path, "w", encoding="utf-8") as f:
-        f.write(META_AGENT_PROMPT)
+        f.write(meta_agent_prompt)
     logger.info(f"  ✓ Saved meta-agent prompt to: {meta_agent_prompt_path}")
 
     asyncio.run(
         run_agent(
             model_name=meta_model,
-            max_turns="20",
-            prompt=META_AGENT_PROMPT,
-            agent_working_directory=META_AGENT_WORKING_DIRECTORY,
+            max_turns=str(Config.DEFAULT_MAX_TURNS),
+            prompt=meta_agent_prompt,
+            agent_working_directory=run_setup.meta_agent_working_directory,
             backend=backend,
         )
     )
@@ -615,304 +1066,36 @@ NOTE: The agent execution log may be incomplete or contain errors if the target 
     # SECTION 5: Main Loop - Run Target Agent and Feedback Agent
     # ========================
 
-    # Define the dataset directory and working directory to pass as arguments
     DATASET_DIRECTORY = os.path.join(task_dir, "data/public")
     ABS_DATASET_DIRECTORY = os.path.abspath(DATASET_DIRECTORY)
     logger.info(f"Dataset directory: {ABS_DATASET_DIRECTORY}")
 
-    # Run the loop for max_gen generations
-    # gen_1 is already created by meta-agent, so we loop from gen_1 to max_gen
     for current_gen in range(1, max_gen + 1):
         logger.info("=" * 80)
         logger.info(f"Starting Generation {current_gen} of {max_gen}")
         logger.info("=" * 80)
 
-        # ========================
-        # SECTION 5a: Run Target Agent
-        # ========================
-
-        current_gen_directory = os.path.abspath(f"{RUN_DIRECTORY}/gen_{current_gen}")
-        target_agent_path = os.path.join(current_gen_directory, "target_agent.py")
-
-        logger.info(f"Running target agent: {target_agent_path}")
-
-        # Track execution results for feedback agent
-        target_agent_success = True
-        target_agent_stdout = ""
-        target_agent_stderr = ""
-        target_agent_error_msg = ""
-
-        # Create log file paths
-        stdout_log_file = os.path.join(current_gen_directory, "target_agent_stdout.log")
-        stderr_log_file = os.path.join(current_gen_directory, "target_agent_stderr.log")
-
-        logger.info(f"  → Stdout log: {stdout_log_file}")
-        logger.info(f"  → Stderr log: {stderr_log_file}")
-        logger.info("=" * 60)
-
-        # Start timing for this generation
-        generation_start_time = time.time()
-
-        # Run target agent with real-time output using shell redirection
-        try:
-            # Build command with tee for real-time display and logging
-            # Use PIPEFAIL to catch failures in the python command, not just tee
-            python_exec = os.path.join(venv_dir, "bin", "python")
-            command = f"set -o pipefail; {python_exec} -u {target_agent_path} --dataset_dir {ABS_DATASET_DIRECTORY} --working_dir {current_gen_directory} 2>&1 | tee {stdout_log_file}"
-
-            # Run with shell=True and bash to enable pipefail
-            result = subprocess.run(
-                command,
-                shell=True,
-                text=True,
-                executable="/bin/bash",  # Use bash to support pipefail
-            )
-
-            return_code = result.returncode
-
-            # Read captured output from file for feedback agent
-            with open(stdout_log_file) as f:
-                target_agent_stdout = f.read()
-            # Since we're using 2>&1, stderr is merged into stdout
-            target_agent_stderr = ""
-
-            logger.info("=" * 60)
-
-            # Check if execution was successful
-            if return_code != 0:
-                target_agent_success = False
-                target_agent_error_msg = f"Target agent failed with exit code {return_code}"
-                logger.error(f"  ✗ Target agent execution failed with exit code {return_code}")
-                logger.warning("  → Continuing with feedback agent despite target agent failure")
-            else:
-                target_agent_success = True
-                logger.info(f"  ✓ Generation {current_gen} target agent execution completed successfully")
-
-        except FileNotFoundError:
-            logger.error(f"  ✗ Target agent file not found: {target_agent_path}")
-            logger.error("  → Cannot continue. Exiting.")
-            sys.exit(1)
-        except Exception as e:
-            target_agent_success = False
-            target_agent_error_msg = f"Unexpected error during target agent execution: {e!s}"
-            logger.error(f"  ✗ {target_agent_error_msg}")
-            logger.warning("  → Continuing with feedback agent despite target agent failure")
-
-            # Try to read any partial logs
-            try:
-                with open(stdout_log_file) as f:
-                    target_agent_stdout = f.read()
-            except OSError:
-                pass  # If log files don't exist, keep empty strings
-
-        # Calculate execution duration
-        generation_duration = time.time() - generation_start_time
-
-        # ========================
-        # SECTION 5a.1: Run Evaluation (if evaluate.py exists)
-        # ========================
-
-        logger.info("=" * 60)
-        logger.info("Running evaluation (if available)...")
-        run_evaluation(current_gen_directory, task_dir, venv_dir)
-        logger.info("=" * 60)
-
-        # Check if improvement.md exists in current gen directory (created by previous feedback agent)
-        improvement_md_path = os.path.join(current_gen_directory, "improvement.md")
-
-        # Add generation to context (do this before feedback agent runs)
-        context_mgr.add_generation(
-            gen_num=current_gen,
-            gen_data={
-                "success": target_agent_success,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "duration": generation_duration,
-                "agent_path": target_agent_path,
-                "gen_dir": current_gen_directory,
-                "improvement_path": improvement_md_path if os.path.exists(improvement_md_path) else None,
-                "execution_type": "Multi-trajectory"
-                if (os.path.isdir(os.path.join(current_gen_directory, "agent_execution")))
-                else "Single",
-            },
+        run_generation(
+            current_gen=current_gen,
+            max_gen=max_gen,
+            run_setup=run_setup,
+            task_files=task_files,
+            abs_dataset_dir=ABS_DATASET_DIRECTORY,
+            dataset_dir=DATASET_DIRECTORY,
+            meta_model=meta_model,
+            backend=backend,
+            sandbox=args.sandbox,
+            env_config=env_config,
         )
-
-        # ========================
-        # SECTION 5b: Run Feedback Agent (if not the last generation)
-        # ========================
-
-        if current_gen < max_gen:
-            logger.info(f"Running feedback agent for generation {current_gen}")
-
-            # Load artifacts produced by the target agent so the feedback prompt is fully populated.
-            AGENT_PY = Path(current_gen_directory, "target_agent.py").read_text(encoding="utf-8")
-            TASK = Path(DATASET_DIRECTORY, "task.md").read_text(encoding="utf-8")
-
-            # Load agent execution log (supports both single-file and multi-trajectory formats)
-            logger.info("Loading agent execution log...")
-            AGENT_EXECUTION, is_multi_trajectory = load_agent_execution(current_gen_directory)
-
-            # Build execution section for the feedback prompt
-            if is_multi_trajectory:
-                # Multi-trajectory format
-                trajectory_count = AGENT_EXECUTION.get("count", 0)
-                trajectories = AGENT_EXECUTION.get("trajectories", [])
-
-                # Calculate success/failure counts
-                # Successful trajectory = list of messages
-                # Failed trajectory = dict with "error" key
-                successful = sum(1 for t in trajectories if isinstance(t, list))
-                failed = sum(1 for t in trajectories if isinstance(t, dict) and t.get("error"))
-                # Note: failed might not equal trajectory_count - successful if there are unexpected formats
-
-                # Show first 3 trajectories as examples
-                sample_trajectories_text = ""
-                for idx, traj in enumerate(trajectories[:3]):
-                    traj_json = json.dumps(traj, indent=2)
-                    # Truncate if too long
-                    if len(traj_json) > 1000:
-                        traj_json = traj_json[:1000] + "\n  ... (truncated)"
-                    sample_trajectories_text += f"\n### Trajectory {idx}\n```json\n{traj_json}\n```\n"
-
-                execution_section = f"""
-**MULTI-TRAJECTORY EXECUTION**:
-
-The agent executed {trajectory_count} separate trajectories (e.g., different questions/samples).
-
-**Summary**:
-- Total trajectories: {trajectory_count}
-- Successful: {successful}
-- Failed: {failed}
-- Execution folder: {os.path.join(current_gen_directory, "agent_execution")}
-
-**Sample Trajectories** (first 3 shown, you can read others from the folder):
-{sample_trajectories_text}
-
-**To analyze all trajectories**:
-- Read files from: {os.path.join(current_gen_directory, "agent_execution")}
-- Files named: execution_q0.json, execution_q1.json, ..., execution_q{trajectory_count - 1}.json
-
-**Analysis guidance**:
-- Look for common failure patterns across trajectories
-- Check if trajectories are properly isolated
-- Ensure consistent behavior across all samples
-"""
-            else:
-                # Single-trajectory format (backwards compatible)
-                execution_section = f"""
-Here is the target agent execution trajectory:
-```json
-{json.dumps(AGENT_EXECUTION, indent=2)}
-```
-
-NOTE: If you see an "error" field in the above JSON, it means the execution log was malformed or missing. Focus on making the agent more robust.
-"""
-
-            # Load evaluation results if available
-            eval_results_section = ""
-            results_json_path = os.path.join(current_gen_directory, "results.json")
-            if os.path.exists(results_json_path):
-                try:
-                    with open(results_json_path, encoding="utf-8") as f:
-                        eval_data = json.load(f)
-                    eval_results_section = f"""
-
-**EVALUATION RESULTS**:
-```json
-{json.dumps(eval_data, indent=2)}
-```
-"""
-                except Exception as e:
-                    eval_results_section = f"\n**EVALUATION RESULTS**: Error loading results.json: {e}\n"
-            else:
-                eval_results_section = (
-                    "\n**EVALUATION RESULTS**: No results.json found (evaluation may not have run or may have failed)\n"
-                )
-
-            # Prepare execution status for feedback agent
-            if target_agent_success:
-                # Get last 10 lines of stdout for quick preview
-                stdout_lines = target_agent_stdout.split("\n")
-                last_10_lines = "\n".join(stdout_lines[-10:]) if len(stdout_lines) > 10 else target_agent_stdout
-
-                execution_status = f"""SUCCESS: Target agent completed execution successfully.
-{eval_results_section}
-
-**Last 10 lines of output**:
-```
-{last_10_lines}
-```
-
-Full logs available at: {stdout_log_file}
-"""
-            else:
-                # Get last 10 lines of stdout for quick preview
-                stdout_lines = target_agent_stdout.split("\n")
-                last_10_lines = "\n".join(stdout_lines[-10:]) if len(stdout_lines) > 10 else target_agent_stdout
-
-                execution_status = f"""FAILED: {target_agent_error_msg}
-{eval_results_section}
-
-**Last 10 lines of output**:
-```
-{last_10_lines}
-```
-
-Full logs available at: {stdout_log_file}
-
-STDERR:
-{target_agent_stderr}
-"""
-
-            # Prepare next generation directory
-            next_gen = current_gen + 1
-            next_gen_directory = os.path.abspath(f"{RUN_DIRECTORY}/gen_{next_gen}")
-
-            # Build previous generations list
-            previous_gens_list = list(range(1, current_gen)) if current_gen > 1 else []
-            previous_gens_text = ", ".join(map(str, previous_gens_list)) if previous_gens_list else "None"
-
-            # Call feedback agent with full context
-            feedback_agent_prompt_prepared = FEEDBACK_AGENT_PROMPT.format(
-                CURRENT_GEN=current_gen,
-                PREVIOUS_GENS=previous_gens_text,
-                CONTEXT_MD_PATH=os.path.join(RUN_DIRECTORY, "context.md"),
-                SAMPLE_TASK_DESCRIPTIONS=SAMPLE_TASK_DESCRIPTIONS,
-                AGENT_PY=AGENT_PY,
-                TASK=TASK,
-                EXECUTION_STATUS=execution_status,
-                EXECUTION_SECTION=execution_section,
-                IMPROVEMENT_DIR=next_gen_directory,
-            )
-
-            os.makedirs(next_gen_directory, exist_ok=True)
-
-            # Save the feedback agent prompt for debugging/transparency
-            feedback_prompt_path = os.path.join(next_gen_directory, "feedback_agent_prompt.txt")
-            with open(feedback_prompt_path, "w", encoding="utf-8") as f:
-                f.write(feedback_agent_prompt_prepared)
-            logger.info(f"  ✓ Saved feedback agent prompt to: {feedback_prompt_path}")
-            asyncio.run(
-                run_agent(
-                    model_name=meta_model,
-                    max_turns="20",
-                    prompt=feedback_agent_prompt_prepared,
-                    agent_working_directory=next_gen_directory,
-                    backend=backend,
-                )
-            )
-
-            logger.info(f"Feedback agent completed. Created improved agent for generation {next_gen}")
-        else:
-            logger.info(f"Generation {current_gen} is the final generation. Skipping feedback agent.")
 
     # Finalize context with summary statistics
     logger.info("Finalizing context.md with summary statistics...")
-    context_mgr.finalize()
+    run_setup.context_mgr.finalize()
 
     logger.info("=" * 80)
     logger.info(f"Orchestrator completed all {max_gen} generations successfully!")
-    logger.info(f"Results saved in: {RUN_DIRECTORY}")
-    logger.info(f"Context summary: {os.path.join(RUN_DIRECTORY, 'context.md')}")
+    logger.info(f"Results saved in: {run_setup.run_directory}")
+    logger.info(f"Context summary: {os.path.join(run_setup.run_directory, 'context.md')}")
     logger.info("=" * 80)
 
 

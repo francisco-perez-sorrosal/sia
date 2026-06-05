@@ -7,12 +7,44 @@ including code changes, performance metrics, and insights across iterations.
 
 import asyncio
 import json
+import logging
 import os
 import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from sia.config import Config
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_read_file(path: str | Path, max_bytes: int = Config.MAX_CONTEXT_FILE_SIZE) -> str | None:
+    """Read a file with size limit. Returns None if file exceeds max_bytes."""
+    try:
+        file_size = os.path.getsize(path)
+        if file_size > max_bytes:
+            logger.warning(f"File too large ({file_size:,} bytes > {max_bytes:,}): {path}")
+            return None
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning(f"Could not read file: {path}: {e}")
+        return None
+
+
+def _safe_load_json(path: str, max_bytes: int = Config.MAX_CONTEXT_FILE_SIZE) -> dict | list | None:
+    """Load JSON with size limit. Returns None if file exceeds max_bytes."""
+    try:
+        file_size = os.path.getsize(path)
+        if file_size > max_bytes:
+            logger.warning(f"JSON file too large ({file_size:,} bytes > {max_bytes:,}): {path}")
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not load JSON: {path}: {e}")
+        return None
 
 
 class ContextManager:
@@ -35,8 +67,8 @@ class ContextManager:
         self.context_path = os.path.join(run_directory, "context.md")
         self.config = run_config
         self.generations = []
-        self.meta_model = run_config.get("meta_model", "haiku")
-        self.backend = run_config.get("backend", "claude")
+        self.meta_model = run_config.get("meta_model", Config.DEFAULT_CLAUDE_META_MODEL)
+        self.backend = run_config.get("backend", Config.DEFAULT_BACKEND)
 
     def initialize(self):
         """Create context.md with header information"""
@@ -54,7 +86,7 @@ class ContextManager:
 """
         with open(self.context_path, "w", encoding="utf-8") as f:
             f.write(header)
-        print(f"Initialized context.md at {self.context_path}")
+        logger.info(f"Initialized context.md at {self.context_path}")
 
     def _generate_llm_summary(self, gen_num: int, gen_data: dict[str, Any], metrics: dict[str, Any]) -> str | None:
         """
@@ -75,22 +107,27 @@ class ContextManager:
         try:
             # Read current generation's target_agent.py
             current_agent_path = gen_data["agent_path"]
-            current_agent_code = Path(current_agent_path).read_text(encoding="utf-8")
+            current_agent_code = _safe_read_file(current_agent_path)
+            if current_agent_code is None:
+                logger.warning(f"Could not read current agent code for gen {gen_num}, skipping LLM summary")
+                return None
 
             # Read previous generation's target_agent.py
             prev_gen_dir = os.path.join(self.run_dir, f"gen_{gen_num - 1}")
             prev_agent_path = os.path.join(prev_gen_dir, "target_agent.py")
-            prev_agent_code = (
-                Path(prev_agent_path).read_text(encoding="utf-8")
-                if os.path.exists(prev_agent_path)
-                else "Not available"
-            )
+            prev_agent_code = _safe_read_file(prev_agent_path)
+            if prev_agent_code is None:
+                if not os.path.exists(prev_agent_path):
+                    prev_agent_code = "Not available"
+                else:
+                    logger.warning(f"Could not read previous agent code for gen {gen_num - 1}")
+                    prev_agent_code = "Not available (file too large or unreadable)"
 
             # Read improvement.md from current generation
             improvement_path = gen_data.get("improvement_path")
             improvement_content = ""
             if improvement_path and os.path.exists(improvement_path):
-                improvement_content = Path(improvement_path).read_text(encoding="utf-8")
+                improvement_content = _safe_read_file(improvement_path) or ""
 
             # Get previous generation's metrics
             prev_metrics = self.generations[-1]["metrics"] if self.generations else {}
@@ -113,12 +150,12 @@ class ContextManager:
 
 **PREVIOUS AGENT CODE** (gen_{gen_num - 1}/target_agent.py):
 ```python
-{prev_agent_code[:3000]}{"..." if len(prev_agent_code) > 3000 else ""}
+{prev_agent_code[:Config.AGENT_CODE_PREVIEW_LIMIT]}{"..." if len(prev_agent_code) > Config.AGENT_CODE_PREVIEW_LIMIT else ""}
 ```
 
 **CURRENT AGENT CODE** (gen_{gen_num}/target_agent.py):
 ```python
-{current_agent_code[:3000]}{"..." if len(current_agent_code) > 3000 else ""}
+{current_agent_code[:Config.AGENT_CODE_PREVIEW_LIMIT]}{"..." if len(current_agent_code) > Config.AGENT_CODE_PREVIEW_LIMIT else ""}
 ```
 
 **METRICS COMPARISON**:
@@ -142,7 +179,7 @@ class ContextManager:
 
                     await run_agent(
                         model_name=self.meta_model,
-                        max_turns="5",
+                        max_turns=str(Config.CONTEXT_SUMMARY_MAX_TURNS),
                         prompt=file_prompt,
                         agent_working_directory=temp_dir,
                         backend=self.backend,
@@ -150,21 +187,22 @@ class ContextManager:
 
                     # Read the summary from file
                     if os.path.exists(summary_file):
-                        return Path(summary_file).read_text(encoding="utf-8").strip()
+                        summary_text = _safe_read_file(summary_file)
+                        return summary_text.strip() if summary_text else None
                     return None
 
                 # Run async function
                 summary = asyncio.run(get_summary())
 
                 if summary:
-                    print(f"Generated LLM summary for Generation {gen_num}")
+                    logger.info(f"Generated LLM summary for Generation {gen_num}")
                     return summary
                 else:
-                    print(f"Warning: Could not generate LLM summary for Generation {gen_num}")
+                    logger.warning(f"Could not generate LLM summary for Generation {gen_num}")
                     return None
 
-        except Exception as e:
-            print(f"Warning: Error generating LLM summary: {e}")
+        except (OSError, RuntimeError) as e:
+            logger.warning(f"Error generating LLM summary: {e}")
             return None
 
     def _format_metrics_comparison(self, prev_metrics: dict[str, Any], current_metrics: dict[str, Any]) -> str:
@@ -249,7 +287,7 @@ class ContextManager:
             }
         )
 
-        print(f"Added Generation {gen_num} to context.md")
+        logger.info(f"Added Generation {gen_num} to context.md")
 
     def finalize(self):
         """Add summary statistics at the end of context.md"""
@@ -309,7 +347,7 @@ class ContextManager:
         with open(self.context_path, "a", encoding="utf-8") as f:
             f.write(summary)
 
-        print("Finalized context.md with summary statistics")
+        logger.info("Finalized context.md with summary statistics")
 
     def _get_agent_stats(self, agent_path: str) -> dict[str, int]:
         """Get file statistics for target_agent.py"""
@@ -318,8 +356,8 @@ class ContextManager:
                 lines = len(f.readlines())
             size = os.path.getsize(agent_path)
             return {"size": size, "lines": lines}
-        except Exception as e:
-            print(f"Warning: Could not get agent stats: {e}")
+        except OSError as e:
+            logger.warning(f"Could not get agent stats: {e}")
             return {"size": 0, "lines": 0}
 
     def _extract_metrics(self, gen_dir: str) -> dict[str, Any]:
@@ -329,38 +367,32 @@ class ContextManager:
         # Priority 1: results.json - load ALL fields generically
         results_path = os.path.join(gen_dir, "results.json")
         if os.path.exists(results_path):
-            try:
-                with open(results_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                    # Extract all top-level scalar values (skip nested dicts/lists for now)
-                    for key, value in data.items():
-                        if isinstance(value, (int, float, str, bool)):
-                            metrics[key] = value
-                        # For common nested structures, try to extract useful info
-                        elif key == "per_class" and isinstance(value, dict):
-                            # Skip per_class details, too verbose for context
-                            continue
-                        elif isinstance(value, dict):
-                            # Skip other nested dicts
-                            continue
-                        elif isinstance(value, list) and len(value) > 0:
-                            # Skip lists
-                            continue
-            except Exception as e:
-                print(f"Warning: Could not parse results.json: {e}")
+            data = _safe_load_json(results_path)
+            if data is not None and isinstance(data, dict):
+                # Extract all top-level scalar values (skip nested dicts/lists for now)
+                for key, value in data.items():
+                    if isinstance(value, (int, float, str, bool)):
+                        metrics[key] = value
+                    # For common nested structures, try to extract useful info
+                    elif key == "per_class" and isinstance(value, dict):
+                        # Skip per_class details, too verbose for context
+                        continue
+                    elif isinstance(value, dict):
+                        # Skip other nested dicts
+                        continue
+                    elif isinstance(value, list) and len(value) > 0:
+                        # Skip lists
+                        continue
 
         # Priority 2: detailed_results.json
         detailed_results_path = os.path.join(gen_dir, "detailed_results.json")
         if os.path.exists(detailed_results_path) and not metrics:
-            try:
-                with open(detailed_results_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                    # Extract all top-level scalar values
-                    for key, value in data.items():
-                        if isinstance(value, (int, float, str, bool)):
-                            metrics[key] = value
-            except Exception as e:
-                print(f"Warning: Could not parse detailed_results.json: {e}")
+            data = _safe_load_json(detailed_results_path)
+            if data is not None and isinstance(data, dict):
+                # Extract all top-level scalar values
+                for key, value in data.items():
+                    if isinstance(value, (int, float, str, bool)):
+                        metrics[key] = value
 
         # Priority 3: Parse stdout
         stdout_path = os.path.join(gen_dir, "target_agent_stdout.log")
@@ -372,75 +404,70 @@ class ContextManager:
     def _parse_stdout_metrics(self, stdout_path: str) -> dict[str, Any]:
         """Parse metrics from stdout log using regex patterns"""
         metrics = {}
-        try:
-            with open(stdout_path, encoding="utf-8") as f:
-                content = f.read()
+        content = _safe_read_file(stdout_path)
+        if content is None:
+            return metrics
 
-                # Look for common patterns
-                patterns = {
-                    "accuracy": [
-                        r"accuracy[:\s=]+(\d+\.?\d*)\s*%?",
-                        r"final\s+accuracy[:\s=]+(\d+\.?\d*)\s*%?",
-                        r"test\s+accuracy[:\s=]+(\d+\.?\d*)\s*%?",
-                    ],
-                    "validation": [
-                        r"validation[:\s=]+(\d+\.?\d*)",
-                        r"val[:\s=]+(\d+\.?\d*)",
-                    ],
-                    "correct": [
-                        r"(\d+)\s*/\s*\d+\s+correct",
-                        r"correct[:\s=]+(\d+)",
-                    ],
-                    "total": [
-                        r"\d+\s*/\s*(\d+)\s+(?:questions|samples|total)",
-                    ],
-                }
+        # Look for common patterns
+        patterns = {
+            "accuracy": [
+                r"accuracy[:\s=]+(\d+\.?\d*)\s*%?",
+                r"final\s+accuracy[:\s=]+(\d+\.?\d*)\s*%?",
+                r"test\s+accuracy[:\s=]+(\d+\.?\d*)\s*%?",
+            ],
+            "validation": [
+                r"validation[:\s=]+(\d+\.?\d*)",
+                r"val[:\s=]+(\d+\.?\d*)",
+            ],
+            "correct": [
+                r"(\d+)\s*/\s*\d+\s+correct",
+                r"correct[:\s=]+(\d+)",
+            ],
+            "total": [
+                r"\d+\s*/\s*(\d+)\s+(?:questions|samples|total)",
+            ],
+        }
 
-                for metric_name, pattern_list in patterns.items():
-                    for pattern in pattern_list:
-                        match = re.search(pattern, content, re.IGNORECASE)
-                        if match:
-                            try:
-                                value = float(match.group(1))
-                                metrics[metric_name] = value
-                                break
-                            except (ValueError, TypeError):
-                                continue
-        except Exception as e:
-            print(f"Warning: Could not parse stdout metrics: {e}")
+        for metric_name, pattern_list in patterns.items():
+            for pattern in pattern_list:
+                match = re.search(pattern, content, re.IGNORECASE)
+                if match:
+                    try:
+                        value = float(match.group(1))
+                        metrics[metric_name] = value
+                        break
+                    except (ValueError, TypeError):
+                        continue
 
         return metrics
 
     def _extract_insights(self, improvement_path: str) -> list[str]:
         """Extract key points from improvement.md"""
         insights = []
-        try:
-            with open(improvement_path, encoding="utf-8") as f:
-                content = f.read()
+        content = _safe_read_file(improvement_path)
+        if content is None:
+            return insights
 
-                # Look for bullet points or numbered items in improvement.md
-                # Pattern 1: Lines starting with - or *
-                bullet_pattern = r"^[-*]\s+(.+)$"
-                bullets = re.findall(bullet_pattern, content, re.MULTILINE)
+        # Look for bullet points or numbered items in improvement.md
+        # Pattern 1: Lines starting with - or *
+        bullet_pattern = r"^[-*]\s+(.+)$"
+        bullets = re.findall(bullet_pattern, content, re.MULTILINE)
 
-                # Pattern 2: Numbered items
-                numbered_pattern = r"^\d+\.\s+(.+)$"
-                numbered = re.findall(numbered_pattern, content, re.MULTILINE)
+        # Pattern 2: Numbered items
+        numbered_pattern = r"^\d+\.\s+(.+)$"
+        numbered = re.findall(numbered_pattern, content, re.MULTILINE)
 
-                # Combine and take first 5 meaningful insights
-                all_insights = bullets + numbered
+        # Combine and take first 5 meaningful insights
+        all_insights = bullets + numbered
 
-                # Filter out very short or header-like items
-                meaningful_insights = [
-                    insight.strip()
-                    for insight in all_insights
-                    if len(insight.strip()) > 20 and not insight.strip().endswith(":")
-                ]
+        # Filter out very short or header-like items
+        meaningful_insights = [
+            insight.strip()
+            for insight in all_insights
+            if len(insight.strip()) > 20 and not insight.strip().endswith(":")
+        ]
 
-                insights = meaningful_insights[:5]
-        except Exception as e:
-            print(f"Warning: Could not extract insights: {e}")
-
+        insights = meaningful_insights[:5]
         return insights
 
     def _format_generation_entry(
@@ -485,7 +512,7 @@ class ContextManager:
                 entry += "- Key changes from improvement.md:\n"
                 for insight in insights[:3]:
                     # Truncate very long insights
-                    insight_text = insight[:200] + "..." if len(insight) > 200 else insight
+                    insight_text = insight[:Config.INSIGHT_PREVIEW_LIMIT] + "..." if len(insight) > Config.INSIGHT_PREVIEW_LIMIT else insight
                     entry += f"  * {insight_text}\n"
 
         # Add LLM-generated summary if available
