@@ -1,0 +1,34 @@
+graph TD
+    subgraph Inputs["Fixed context (per task)"]
+        U["Task spec U<br/>(benchmark description + samples)"]
+        V["Verifier V<br/>(deterministic grader)"]
+        R["Reference impls R"]
+    end
+
+    U --> Meta
+    R --> Meta
+    Meta["Meta-Agent M<br/>builds initial scaffold A&#8321; = M(U, R)"]
+
+    Meta --> Target
+
+    subgraph Agent["Task-Specific Agent A_g"]
+        Scaffold["Scaffold / harness<br/>system prompt - tools - parsers - retry"]
+        Weights["Weights &#952; (LoRA r=32)<br/>on base LLM gpt-oss-120b"]
+    end
+
+    Meta -. initialises .-> Scaffold
+    Target["Execute A_g on dataset D<br/>(sandbox: RO data, RW workdir)"]
+    Scaffold --> Target
+    Weights --> Target
+    V --> Target
+
+    Target -->|"trajectory &#964;_g + metrics E_g"| Feedback{"Feedback-Agent F<br/>select next lever"}
+
+    Feedback -->|"HARNESS update<br/>(weights fixed)"| HUpdate["Rewrite scaffold<br/>A_g+1 = F(A_g, &#964;_g, E_g, U)<br/><i>externalises: tools, parsers, retry</i>"]
+    Feedback -->|"WEIGHT update<br/>(scaffold fixed)"| WUpdate["RL on &#952; via PPO-GAE / GRPO /<br/>entropic-weighting / DPO ...<br/><i>internalises: domain knowledge</i>"]
+
+    HUpdate -. updated scaffold .-> Scaffold
+    WUpdate -. updated LoRA .-> Weights
+
+    HUpdate -->|"next generation (g < G_max)"| Target
+    WUpdate -->|"next generation (g < G_max)"| Target

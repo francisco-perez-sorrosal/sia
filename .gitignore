@@ -213,3 +213,16 @@ task_1/public/data
 
 data
 runs
+
+# AI assistants
+.ai-work/
+.ai-state/*.lock
+.ai-state/**/*.lock
+.ai-state/*.backup.json
+.ai-state/*.pre-forget.json
+.ai-state/observations.jsonl
+.claude/settings.local.json
+.claude/worktrees/
+.env
+.env.*
+.env.local

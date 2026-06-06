@@ -1,0 +1,71 @@
+// SIA (Self-Improving AI) — C4 architecture model.
+// Two views project from this single model: System Context (L0) and Components (L1).
+// Regenerate renders:
+//   likec4 gen d2 docs/diagrams/architecture/src/architecture.c4 -o docs/diagrams/architecture/rendered/
+//   d2 docs/diagrams/architecture/rendered/context.d2    docs/diagrams/architecture/rendered/context.svg
+//   d2 docs/diagrams/architecture/rendered/components.d2 docs/diagrams/architecture/rendered/components.svg
+
+specification {
+  element person
+  element system
+  element component
+  element external
+}
+
+model {
+  user = person "Researcher" {
+    description "Runs `sia` from the CLI to evolve a task-specific agent"
+  }
+
+  llm = external "Agent Backend LLM" {
+    description "Claude (claude-agent-sdk) or OpenHands SDK — drives meta & feedback agents"
+  }
+
+  docker = external "Docker (optional)" {
+    description "Container runtime for sandboxed target-agent execution (--sandbox docker)"
+  }
+
+  sia = system "SIA Orchestrator" {
+    description "Self-improving loop: meta-agent generates a target agent; feedback agent rewrites it across generations"
+
+    orchestrator = component "Orchestrator" {
+      description "CLI entry, generation loop, prompt assembly, subprocess control (sia/orchestrator.py)"
+    }
+    contextManager = component "Context Manager" {
+      description "Tracks generation evolution; writes runs/run_N/context.md; LLM diff summaries (sia/context_manager.py)"
+    }
+    agentRunner = component "Agent Runner" {
+      description "Backend dispatch (claude | openhands) for meta/feedback agents (sia/util.py)"
+    }
+    config = component "Config" {
+      description "Centralized defaults + SIA_* env overrides (sia/config.py)"
+    }
+    bundledTasks = component "Bundled Tasks (package data)" {
+      description "task.md, reference agent, sample descriptions, evaluate.py per task (sia/tasks/)"
+    }
+
+    orchestrator -> contextManager "records each generation"
+    orchestrator -> agentRunner "runs meta / feedback agent"
+    orchestrator -> config "reads defaults / env overrides"
+    orchestrator -> bundledTasks "loads task reference files"
+    contextManager -> agentRunner "requests LLM diff summary"
+    contextManager -> config "reads limits"
+    agentRunner -> config "reads max-turns default"
+  }
+
+  user -> sia.orchestrator "sia --task ... --max_gen N"
+  sia.agentRunner -> llm "meta / feedback agent calls"
+  sia.orchestrator -> docker "runs target agent (sandbox mode)"
+}
+
+views {
+  view context of sia {
+    title "SIA — System Context (L0)"
+    include user, sia, llm, docker
+  }
+
+  view components of sia {
+    title "SIA — Components (L1)"
+    include *
+  }
+}

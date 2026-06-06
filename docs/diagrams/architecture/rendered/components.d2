@@ -1,0 +1,41 @@
+direction: down
+
+User: {
+  label: "Researcher"
+}
+Sia: {
+  label: "SIA Orchestrator"
+
+  Orchestrator: {
+    label: "Orchestrator"
+  }
+  ContextManager: {
+    label: "Context Manager"
+  }
+  BundledTasks: {
+    label: "Bundled Tasks (package data)"
+  }
+  AgentRunner: {
+    label: "Agent Runner"
+  }
+  Config: {
+    label: "Config"
+  }
+}
+Docker: {
+  label: "Docker (optional)"
+}
+Llm: {
+  label: "Agent Backend LLM"
+}
+
+User -> Sia.Orchestrator: "sia --task ... --max_gen N"
+Sia.Orchestrator -> Sia.ContextManager: "records each generation"
+Sia.Orchestrator -> Sia.AgentRunner: "runs meta / feedback agent"
+Sia.Orchestrator -> Sia.Config: "reads defaults / env overrides"
+Sia.Orchestrator -> Sia.BundledTasks: "loads task reference files"
+Sia.ContextManager -> Sia.AgentRunner: "requests LLM diff summary"
+Sia.ContextManager -> Sia.Config: "reads limits"
+Sia.AgentRunner -> Sia.Config: "reads max-turns default"
+Sia.Orchestrator -> Docker: "runs target agent (sandbox mode)"
+Sia.AgentRunner -> Llm: "meta / feedback agent calls"

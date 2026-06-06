@@ -1,0 +1,35 @@
+sequenceDiagram
+    autonumber
+    actor User as Researcher
+    participant Orch as Orchestrator
+    participant Runner as Agent Runner
+    participant LLM as Backend LLM
+    participant Target as Target Agent subprocess
+    participant Eval as evaluate.py subprocess
+    participant Ctx as Context Manager
+
+    User->>Orch: sia --task gpqa --max_gen N
+    Orch->>Orch: load task files (task.md, reference agent, sample exec)
+    Orch->>Orch: create runs/run_N/ and per-run venv
+
+    Note over Orch,LLM: Generation 1 — meta-agent bootstraps target agent
+    Orch->>Runner: run meta-agent (build_meta_prompt)
+    Runner->>LLM: generate target_agent.py
+    LLM-->>Target: writes gen_1/target_agent.py
+
+    loop for gen in 1..N
+        Orch->>Target: run target agent (subprocess in venv or Docker)
+        Target-->>Orch: agent_execution log + stdout log
+        Orch->>Eval: run evaluate.py --gen-dir (if present)
+        Eval-->>Orch: results.json
+        Orch->>Ctx: add_generation(metrics, agent stats)
+        Ctx->>Runner: LLM diff summary (gen > 1)
+        alt gen < N
+            Orch->>Runner: run feedback-agent (build_feedback_prompt)
+            Runner->>LLM: analyze logs, rewrite agent
+            LLM-->>Target: writes gen_{n+1} target_agent.py + improvement.md
+        end
+    end
+
+    Orch->>Ctx: finalize() — summary statistics
+    Ctx-->>User: runs/run_N/context.md

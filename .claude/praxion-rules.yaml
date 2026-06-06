@@ -1,0 +1,5 @@
+# Hackathon mode preset — saves ~3,500 tokens (ambient, every session)
+disable:
+  - swe/agent-model-routing
+  - swe/memory-protocol
+  - swe/vcs/git-conventions

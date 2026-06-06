@@ -1,0 +1,3 @@
+# Praxion semantic merge drivers — see rules/swe/agent-intermediate-documents.md
+.ai-state/memory.json merge=memory-json
+.ai-state/observations.jsonl merge=observations-jsonl

@@ -1,0 +1,18 @@
+direction: down
+
+User: {
+  label: "Researcher"
+}
+Sia: {
+  label: "SIA Orchestrator"
+}
+Llm: {
+  label: "Agent Backend LLM"
+}
+Docker: {
+  label: "Docker (optional)"
+}
+
+User -> Sia: "sia --task ... --max_gen N"
+Sia -> Llm: "meta / feedback agent calls"
+Sia -> Docker: "runs target agent (sandbox mode)"
