@@ -1,0 +1,33 @@
+%% L1 component architecture of the built hackathon system.
+%% Verified against code 2026-06-06: gemma-3-27b-it target + Qwen3-30B R2 on Nebius,
+%% Claude (sonnet) Meta/Feedback via OAuth, 6-DB Spider task, flatten -> demo_data.json seam.
+graph TD
+    subgraph nebius["Nebius Token Factory (OpenAI-compatible wire)"]
+        nbtarget["Target NL→SQL model<br/>google/gemma-3-27b-it"]
+        nbr2["R2 classifier model<br/>Qwen/Qwen3-30B-A3B-Instruct-2507"]
+    end
+    subgraph claudeauth["Claude (CLAUDE_CODE_OAUTH_TOKEN)"]
+        claude["Meta + Feedback agents<br/>--backend claude, --meta_model sonnet"]
+    end
+    subgraph sia["sia/ framework (UNTOUCHED — zero edits)"]
+        loop["orchestrator.py loop<br/>--task_dir --sandbox none · per-run uv venv"]
+        runs[("runs/run_X/gen_*/<br/>target_agent.py · improvement.md · results.json")]
+    end
+    subgraph demo["hackathon_demo/ (NEW · off the sia* wheel glob)"]
+        task["sql_task/<br/>task.md · evaluate.py · 6× &lt;db_id&gt;.sqlite · gold.json"]
+        analyze["analyze/ R2 taxonomy<br/>taxonomy.py · analyze_improvements.py"]
+        flatten["export/flatten.py"]
+        ddj["web/demo_data.json<br/>(the decoupling seam)"]
+        web["web/ static SPA<br/>index.html · app.js (ECharts+GSAP+diff2html)"]
+    end
+
+    task -->|"--task_dir"| loop
+    loop -->|"Meta/Feedback agentic loop"| claude
+    loop -->|"target NL→SQL (raw openai SDK)"| nbtarget
+    loop -->|writes| runs
+    runs -->|read-only| analyze
+    runs -->|read-only| flatten
+    analyze -->|"R2 LLM call (structured output)"| nbr2
+    analyze -->|"per-change taxonomy (LLM + keyword fallback)"| flatten
+    flatten -->|emits per-run| ddj
+    ddj -->|fetch once| web

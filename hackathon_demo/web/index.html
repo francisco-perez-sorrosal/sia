@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JanuSQL — self-improving AI on English→SQL</title>
+
+  <!-- ============================================================= -->
+  <!-- Pinned CDN stack (NEVER @latest — a CDN bump must not break    -->
+  <!-- the demo mid-event). Versions verified 2026-06-06 (all 200).   -->
+  <!-- ============================================================= -->
+  <!-- charts -->
+  <script src="https://cdn.jsdelivr.net/npm/echarts@6.1.0/dist/echarts.min.js"></script>
+  <!-- choreography (GSAP core + formerly-paid plugins, free since Apr 2025) -->
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/DrawSVGPlugin.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/MotionPathPlugin.min.js"></script>
+  <!-- code diff -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.56/bundles/css/diff2html.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.56/bundles/js/diff2html-ui.min.js"></script>
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ============================== CHROME ============================== -->
+  <header class="chrome">
+    <h1 class="chrome__title" id="chrome-title">JanuSQL</h1>
+    <!-- experiment selector: switches the whole demo between the two run files.
+         Bigger model (Gemma) is the opener/default; switch to the smaller Nemotron
+         for the reveal — "smaller model, even bigger SIA gain". -->
+    <div class="exp" id="exp-select" role="group" aria-label="Choose the model">
+      <button class="exp__btn exp__btn--active" id="exp-gemma" type="button"
+              data-file="demo_data_gemma.json" aria-pressed="true">
+        Big model <span class="exp__sub">Gemma 3 &middot; 27B</span>
+      </button>
+      <button class="exp__btn" id="exp-nemotron" type="button"
+              data-file="demo_data_nemotron.json" aria-pressed="false">
+        Small model <span class="exp__sub">Nemotron-Nano &middot; 3B active</span>
+      </button>
+    </div>
+    <div class="chrome__progress">
+      <span class="chrome__screen-label" id="screen-label"></span>
+      <nav class="chrome__dots" id="stage-dots" aria-label="Stage progress">
+        <!-- stage dots injected by app.js -->
+      </nav>
+    </div>
+  </header>
+
+  <!-- ========================= SCREEN VIEWPORT ========================= -->
+  <main class="viewport" id="viewport">
+
+    <!-- Screen 0 — Hook / Title card -->
+    <section class="screen screen--hook" data-screen="0" aria-label="Hook and title">
+      <div class="hook">
+        <p class="hook__kicker">Self-Improving AI · Hackathon demo</p>
+        <h2 class="hook__headline">JanuSQL</h2>
+        <p class="hook__tagline">
+          The Roman god of transitions &mdash; looking at once at past data and
+          future growth.
+        </p>
+        <p class="hook__sub">
+          A self-improving English&rarr;SQL agent on Nebius open models &mdash; it
+          rewrites its own harness, graded by <em>running</em> the SQL.
+        </p>
+        <!-- frozen view of the climb: static sparkline of the real accuracy series -->
+        <div class="hook__spark" id="hook-spark" aria-label="Accuracy across generations"></div>
+        <p class="hook__stat" id="hook-stat"></p>
+        <div class="hook__cta">
+          <button class="btn btn--accent" id="hook-watch" type="button">&#9656; Watch it improve</button>
+        </div>
+        <p class="hook__credit">Built on the SIA harness loop (SIA-H). Team SIA-for-SQL.</p>
+      </div>
+    </section>
+
+    <!-- Screen 1 — The problem (static copy) -->
+    <section class="screen" data-screen="1" aria-label="The problem">
+      <div class="prose">
+        <h2 class="prose__h">Making a task-specific agent better is slow.</h2>
+        <p>
+          Today, tuning an AI agent for one job is mostly manual. A person reads
+          the failures, edits the prompt, adds a tool, fixes a parser &mdash; one
+          change at a time. It needs an expert, and it takes a while.
+        </p>
+        <ul class="prose__list">
+          <li><strong>Manual.</strong> A human reads the logs and rewrites the agent by hand.</li>
+          <li><strong>Slow.</strong> Each round is read-failures &rarr; edit &rarr; re-run.</li>
+          <li><strong>Expert-only.</strong> You need a person fluent in both the task and the tooling.</li>
+        </ul>
+        <p class="prose__q">What if the agent did that loop on itself?</p>
+      </div>
+    </section>
+
+    <!-- Screen 2 — SIA loop explainer (B3: hand-laid SVG + GSAP 4-beat) -->
+    <section class="screen" data-screen="2" aria-label="SIA, the approach">
+      <div class="prose prose--tight">
+        <h2 class="prose__h">SIA: write &rarr; try &rarr; read failures &rarr; rewrite.</h2>
+        <p class="prose__lede">
+          Three agents run a loop. One <strong>writes</strong> the agent, the
+          target <strong>tries</strong> the task and is graded by running its SQL,
+          and a feedback agent <strong>reads the failures</strong> and rewrites the
+          harness for the next generation.
+        </p>
+      </div>
+
+      <!-- hand-laid SVG: Meta -> Target -> Feedback + Verifier glyph + feedback arrow -->
+      <div class="loop">
+        <svg
+          id="loop-svg"
+          class="loop__svg"
+          viewBox="0 0 720 280"
+          role="img"
+          aria-label="The SIA loop: Meta writes, Target tries and is verified, Feedback rewrites; the generation counter advances."
+        >
+          <!-- forward arrows Meta->Target->Feedback -->
+          <line class="loop__edge" x1="190" y1="80" x2="270" y2="80" />
+          <polygon class="loop__edge-head" points="270,80 260,74 260,86" />
+          <line class="loop__edge" x1="450" y1="80" x2="530" y2="80" />
+          <polygon class="loop__edge-head" points="530,80 520,74 520,86" />
+
+          <!-- nodes -->
+          <g class="loop__node" id="node-meta">
+            <rect x="20" y="50" width="170" height="60" rx="8" />
+            <text x="105" y="76" text-anchor="middle">META</text>
+            <text class="loop__node-sub" x="105" y="96" text-anchor="middle">writes the agent</text>
+          </g>
+          <g class="loop__node" id="node-target">
+            <rect x="280" y="50" width="170" height="60" rx="8" />
+            <text x="365" y="76" text-anchor="middle">TARGET</text>
+            <text class="loop__node-sub" x="365" y="96" text-anchor="middle">tries English&rarr;SQL</text>
+          </g>
+          <g class="loop__node" id="node-feedback">
+            <rect x="540" y="50" width="170" height="60" rx="8" />
+            <text x="625" y="76" text-anchor="middle">FEEDBACK</text>
+            <text class="loop__node-sub" x="625" y="96" text-anchor="middle">reads failures</text>
+          </g>
+
+          <!-- Verifier glyph below Target -->
+          <g class="loop__verifier" id="node-verifier">
+            <circle cx="365" cy="160" r="22" />
+            <text x="365" y="166" text-anchor="middle">V</text>
+            <text class="loop__node-sub" x="365" y="200" text-anchor="middle">runs the SQL, grades <tspan class="loop__pass">&#10003;</tspan>/<tspan class="loop__fail">&#10007;</tspan></text>
+          </g>
+          <line class="loop__vline" x1="365" y1="110" x2="365" y2="138" />
+
+          <!-- feedback arrow: Feedback (625) curves back to Meta (105) -->
+          <path
+            id="loop-feedback-arrow"
+            class="loop__feedback"
+            d="M 625 138 C 625 250, 105 250, 105 138"
+            fill="none"
+          />
+          <polygon class="loop__feedback-head" points="105,138 99,150 111,150" />
+          <text class="loop__feedback-label" x="365" y="268" text-anchor="middle">
+            feedback rewrites the agent &mdash; next generation
+          </text>
+
+          <!-- generation counter -->
+          <text class="loop__gen" id="loop-gen" x="660" y="30" text-anchor="end">Generation 1</text>
+        </svg>
+
+        <!-- sparkline of the REAL accuracy series; advances on beat 4 -->
+        <div class="loop__spark-wrap">
+          <span class="loop__spark-label">accuracy across generations (real)</span>
+          <div class="loop__spark" id="loop-spark" aria-label="Accuracy sparkline"></div>
+        </div>
+
+        <p class="loop__beat" id="loop-beat" aria-live="polite"></p>
+        <p class="loop__footnote">
+          SIA can also retrain the model&rsquo;s weights (SIA-W). This build uses
+          only the harness lever (SIA-H): the agent rewrites its own code.
+        </p>
+      </div>
+    </section>
+
+    <!-- Screen 3 — Our task (English->SQL, run-to-grade, on Nebius) -->
+    <section class="screen" data-screen="3" aria-label="Use case">
+      <div class="prose">
+        <h2 class="prose__h">Use case: English &rarr; SQL, graded by running it.</h2>
+        <p>
+          The agent reads a question in plain English and writes a SQL query. We
+          don&rsquo;t score the text &mdash; we <strong>execute the query</strong>
+          against the database and check whether the rows it returns match the
+          right answer. Correct means correct-when-run.
+        </p>
+        <ul class="prose__list">
+          <li><strong>Input:</strong> a natural-language question.</li>
+          <li><strong>Output:</strong> one SQLite query.</li>
+          <li><strong>Grade:</strong> run it read-only; compare the result rows to gold.</li>
+          <li>
+            <strong>Model:</strong>
+            <span class="model-name">a fixed open model on Nebius</span>
+            <!-- educational model-choice hover -->
+            <span class="hint" tabindex="0" aria-label="Why the model is fixed">
+              &#9432;
+              <span class="hint__pop" role="tooltip">
+                The model is <strong>fixed across every generation</strong>. SIA
+                rewrites the <em>harness</em> around it &mdash; it adds the database
+                schema, examples, and error-retry. The climb is a better harness
+                unlocking the same model, not a bigger model. We pick a model strong
+                enough to do well with a good harness, but not so strong it aces the
+                weak first harness &mdash; or there&rsquo;d be nothing to improve.
+                This is the harness lever (SIA-H); SIA can also retrain weights
+                (SIA-W), which this demo does not do.
+              </span>
+            </span>
+          </li>
+        </ul>
+
+        <div class="example" id="example-query" hidden>
+          <span class="example__label">A query the agent wrote</span>
+          <pre class="example__sql" id="example-sql"></pre>
+          <span class="example__verdict" id="example-verdict"></span>
+        </div>
+
+        <!-- credibility: the benchmark + the models, stated plainly -->
+        <div class="taskfacts">
+          <div class="taskfacts__block">
+            <span class="taskfacts__label">Dataset</span>
+            <p class="taskfacts__copy">
+              Evaluated on <strong>Spider</strong> (Yu et al., EMNLP 2018) &mdash; the
+              standard text-to-SQL benchmark &mdash; its <strong>hard + extra-hard</strong>
+              split: <strong>48 questions across 6 databases</strong>. Graded by
+              <strong>executing</strong> the SQL against the real database (execution
+              accuracy). CC-BY-SA-4.0.
+            </p>
+          </div>
+          <div class="taskfacts__block">
+            <span class="taskfacts__label">Models</span>
+            <p class="taskfacts__copy">
+              <strong>Targets that self-improve</strong> (open, served on Nebius Token
+              Factory): <strong>Gemma-3-27B-Instruct</strong> (27B dense &mdash; the
+              &ldquo;big&rdquo; model) and <strong>NVIDIA
+              Nemotron-Nano-30B-A3B</strong> (30B params, ~3B active via MoE &mdash;
+              compute-light, edge-class &mdash; the &ldquo;small&rdquo; model).
+            </p>
+            <p class="taskfacts__copy">
+              <strong>Harness brains</strong> (Meta + Feedback agents):
+              <strong>Claude Sonnet</strong> &mdash; the agentic loop that reads the
+              failures and rewrites the agent.
+              <strong>Improvement classifier</strong>:
+              <strong>Qwen3-30B-A3B-Instruct</strong> (structured output) on Nebius.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Screen 4 — The live improvement: the scrubber's home (BUILT NOW) -->
+    <section class="screen" data-screen="4" aria-label="The live improvement">
+      <!-- the ONE scrubber — gen-number ticks are the sole control -->
+      <div class="scrubber" id="scrubber">
+        <div class="scrubber__head">
+          <span class="scrubber__label">Generation</span>
+          <span class="scrubber__ticks" id="gen-ticks" role="tablist"
+                aria-label="Choose a generation"></span>
+          <span class="scrubber__hint">click a generation · ←/→ to step</span>
+        </div>
+      </div>
+
+      <!-- the 3 panes -->
+      <div class="panes">
+        <div class="pane pane--curve">
+          <h2 class="pane__title">Accuracy (execution-verified)</h2>
+          <div class="pane__body" id="pane-curve"></div>
+        </div>
+        <div class="pane pane--diff">
+          <h2 class="pane__title">What changed</h2>
+          <div class="pane__body whatchanged" id="whatchanged">
+            <!-- Lead: the single most prominent change this generation, spotlighted
+                 with its bucket badge + its authoritative code. The self-repair gen
+                 pulses this block (the wow's pulse target). -->
+            <div class="keychange" id="keychange" hidden>
+              <span class="keychange__kicker">Key change this generation</span>
+              <div class="keychange__head">
+                <span class="keychange__badge" id="keychange-badge"></span>
+                <p class="keychange__summary" id="keychange-summary"></p>
+              </div>
+              <pre class="keychange__code" id="keychange-code"></pre>
+            </div>
+            <!-- Below: the full list of change rows (the topics that changed). The
+                 key change is also spotlighted above — header makes that explicit. -->
+            <p class="changes__head" id="changes-head" hidden>All changes this generation</p>
+            <ul class="changes" id="change-cards"></ul>
+            <!-- Collapsible full diff (diff2html lives ONLY here) -->
+            <details class="fulldiff" id="fulldiff" hidden>
+              <summary class="fulldiff__toggle">Show full diff</summary>
+              <div class="fulldiff__body" id="pane-diff"></div>
+            </details>
+          </div>
+        </div>
+        <div class="pane pane--taxonomy">
+          <h2 class="pane__title" id="taxonomy-title">Research taxonomy</h2>
+          <p class="pane__sub" id="taxonomy-sub"></p>
+          <div class="pane__body" id="pane-taxonomy"></div>
+        </div>
+      </div>
+
+      <p class="caption" id="caption"></p>
+    </section>
+
+    <!-- Screen 5 — The R2 lens (taxonomy explainer + reward-hack smell test) -->
+    <section class="screen" data-screen="5" aria-label="The Research lens">
+      <div class="prose">
+        <h2 class="prose__h">Research: a lens on <em>what</em> each self-improvement was.</h2>
+        <p>
+          The bar on the previous screen shows how many changes the agent made each
+          generation. Research classifies <strong>what kind</strong> each change was &mdash;
+          so you can see whether the agent hardened its plumbing or got better at the
+          actual task.
+        </p>
+        <div class="lens-cats">
+          <div class="lens-cat lens-cat--se">
+            <span class="lens-cat__pct" id="lens-se-pct"></span>
+            <span class="lens-cat__name">Software hygiene</span>
+            <span class="lens-cat__desc">retries, parsers, validation &mdash; making the harness robust.</span>
+          </div>
+          <div class="lens-cat lens-cat--domain">
+            <span class="lens-cat__pct" id="lens-domain-pct"></span>
+            <span class="lens-cat__name">Task reasoning</span>
+            <span class="lens-cat__desc">restructured prompts, schema, examples &mdash; getting better at SQL.</span>
+          </div>
+          <div class="lens-cat lens-cat--hack">
+            <span class="lens-cat__pct" id="lens-hack-count"></span>
+            <span class="lens-cat__name">Reward-hack smell test</span>
+            <span class="lens-cat__desc">changes that game the grader instead of solving the task.</span>
+          </div>
+        </div>
+        <p class="prose__note" id="lens-hack-note"></p>
+      </div>
+    </section>
+
+    <!-- Screen 6 — Result + honest scope (= closing / credits) -->
+    <section class="screen" data-screen="6" aria-label="Result and honest scope">
+      <div class="result">
+        <h2 class="prose__h">The result, and exactly what it means.</h2>
+        <div class="result__nums" id="result-nums"></div>
+
+        <!-- honesty card: stated positively, first-class, not fine print -->
+        <div class="honesty">
+          <div class="honesty__row">
+            <span class="honesty__tag honesty__tag--yes">What we did</span>
+            <p>
+              We aimed SIA at a new English&rarr;SQL task, graded by <em>running</em>
+              the query, on open models via Nebius; and we built a research lens that
+              classifies each self-improvement and flags reward-hacking.
+            </p>
+          </div>
+          <div class="honesty__row">
+            <span class="honesty__tag honesty__tag--no">What we did not do</span>
+            <p>
+              We did not change SIA&rsquo;s core algorithm. This is
+              <strong>SIA-H</strong> &mdash; the agent rewrites its own code
+              (the harness). It is <strong>not SIA-W</strong>: it does not retrain
+              the model&rsquo;s weights. We <em>leveraged and instrumented</em> SIA;
+              we did not improve SIA itself.
+            </p>
+          </div>
+          <div class="honesty__row">
+            <span class="honesty__tag">Honest replay note</span>
+            <p>
+              This is one real, execution-verified run, selected from several for
+              clarity. The numbers are real; the playback is deterministic.
+            </p>
+          </div>
+        </div>
+
+        <div class="result__cta">
+          <button class="btn btn--accent" id="result-restart" type="button">&#8635; Start over</button>
+          <button class="btn" id="result-explore" type="button">&#9656; Explore the run</button>
+        </div>
+        <p class="hook__credit">Team SIA-for-SQL &middot; built on the SIA harness loop.</p>
+      </div>
+    </section>
+
+    <!-- Screen 7 — Ongoing TODO (1/2): Closing the loop (concept + re-routed wire) -->
+    <section class="screen" data-screen="7" aria-label="Ongoing TODO — closing the loop">
+      <div class="prose prose--tight">
+        <p class="todo-kicker">What I want to build next &middot; Framework Enhancement Track</p>
+        <h2 class="prose__h">Now I want to close the loop &mdash; improve the <em>improver</em>.</h2>
+        <p class="prose__lede">
+          So far I made SIA improve the <strong>target</strong> agent, and I built a Research lens
+          that already <strong>measures</strong> what kind of change each self-improvement was &mdash;
+          but that signal dead-ends at a dashboard. <strong>Now I want to close the loop</strong>, so
+          it steers the agent that does the improving.
+        </p>
+      </div>
+
+      <!-- Hero: echo the screen-2 loop, then draw the ONE wire we'd add. -->
+      <div class="cl">
+        <svg
+          id="cl-svg"
+          class="cl__svg"
+          viewBox="-150 0 910 360"
+          role="img"
+          aria-label="The SIA loop with one wire added: the R2 classifier's verdict, which today only reaches a human dashboard, is re-routed back into the loop to steer how the next agent is written."
+        >
+          <!-- forward edges Meta -> Target -> Feedback -->
+          <line class="loop__edge" x1="190" y1="74" x2="305" y2="74" />
+          <polygon class="loop__edge-head" points="305,74 295,68 295,80" />
+          <line class="loop__edge" x1="455" y1="74" x2="570" y2="74" />
+          <polygon class="loop__edge-head" points="570,74 560,68 560,80" />
+
+          <!-- top row: the built loop -->
+          <g class="loop__node">
+            <rect x="40" y="46" width="150" height="56" rx="8" />
+            <text x="115" y="74" text-anchor="middle">META</text>
+            <text class="loop__node-sub" x="115" y="92" text-anchor="middle">writes the agent</text>
+          </g>
+          <g class="loop__node">
+            <rect x="305" y="46" width="150" height="56" rx="8" />
+            <text x="380" y="74" text-anchor="middle">TARGET</text>
+            <text class="loop__node-sub" x="380" y="92" text-anchor="middle">tries English&rarr;SQL</text>
+          </g>
+          <g class="loop__node">
+            <rect x="570" y="46" width="150" height="56" rx="8" />
+            <text x="645" y="74" text-anchor="middle">FEEDBACK</text>
+            <text class="loop__node-sub" x="645" y="92" text-anchor="middle">rewrites it</text>
+          </g>
+
+          <!-- verifier under Target -->
+          <g class="loop__verifier">
+            <circle cx="380" cy="150" r="18" />
+            <text x="380" y="156" text-anchor="middle">V</text>
+          </g>
+          <line class="loop__vline" x1="380" y1="102" x2="380" y2="132" />
+
+          <!-- built return arrow: Feedback -> Meta (Ring 0, already exists) -->
+          <path class="cl__built" d="M 645 102 C 645 220, 115 220, 115 102" fill="none" />
+          <polygon class="cl__built-head" points="115,102 109,114 121,114" />
+          <text class="cl__built-label" x="380" y="210" text-anchor="middle">
+            next generation &middot; the loop you already saw (built)
+          </text>
+
+          <!-- R2 classifier node (the lens, today read-only / post-hoc) -->
+          <g class="cl__r2" id="cl-r2">
+            <rect x="305" y="250" width="150" height="56" rx="8" />
+            <text x="380" y="278" text-anchor="middle">R2 CLASSIFIER</text>
+            <text class="cl__r2-sub" x="380" y="296" text-anchor="middle">labels each change</text>
+          </g>
+
+          <!-- feeder: Feedback's diff -> R2 (down the right side) -->
+          <path class="cl__feeder" d="M 690 102 L 690 278 L 459 278" fill="none" />
+          <polygon class="cl__feeder-head" points="459,278 471,272 471,284" />
+          <text class="cl__feeder-label" x="678" y="140" text-anchor="end">F&rsquo;s diff</text>
+
+          <!-- TODAY: the dead-end — R2 -> a human dashboard (open loop) -->
+          <path class="cl__deadend" d="M 380 306 L 380 338" fill="none" />
+          <polygon class="cl__deadend-head" points="380,338 374,326 386,326" />
+          <text class="cl__deadend-label" x="380" y="354" text-anchor="middle">
+            today &rarr; a dashboard. <tspan class="cl__x">&#10007;</tspan> the loop stops at a human
+          </text>
+
+          <!-- THE NEW WIRE: R2's verdict -> back into the loop (steers the next agent) -->
+          <path class="cl__newwire" id="cl-newwire" d="M 305 278 C 120 270, 18 180, 40 74" fill="none" />
+          <polygon class="cl__newwire-head" id="cl-newwire-head" points="40,74 28,68 28,80" />
+          <text class="cl__newwire-label" x="44" y="170" text-anchor="end">
+            the wire I want to add
+          </text>
+          <text class="cl__newwire-sub" x="44" y="190" text-anchor="end">
+            the credit signal
+          </text>
+          <text class="cl__newwire-sub" x="44" y="207" text-anchor="end">
+            steers the next agent
+          </text>
+        </svg>
+        <p class="cl__note">
+          I&rsquo;d re-enter the verdict through the <strong>task contract both agents already read</strong>
+          &mdash; so I can close the loop <strong>without editing <code>sia/</code></strong> (next screen).
+        </p>
+      </div>
+
+      <!-- three rings of self-improvement -->
+      <div class="rings" aria-label="Three rings of self-improvement">
+        <div class="ring ring--built">
+          <span class="ring__status">&#10003; built</span>
+          <span class="ring__name">Improve the <strong>Target</strong></span>
+          <span class="ring__desc">the agent rewrites its own code &mdash; this demo.</span>
+        </div>
+        <div class="ring ring--todo">
+          <span class="ring__status">&#9633; what I want next</span>
+          <span class="ring__name">Improve the <strong>Improver</strong></span>
+          <span class="ring__desc">the credit signal steers the <strong>Feedback</strong> agent &mdash; <strong>within a single run</strong>.</span>
+        </div>
+        <div class="ring ring--horizon">
+          <span class="ring__status">&#9675; where I&rsquo;m headed</span>
+          <span class="ring__name">Improve the <strong>Meta</strong></span>
+          <span class="ring__desc">a prior aggregated <strong>across many runs</strong> &mdash; seeds <strong>generation&nbsp;1</strong>.</span>
+        </div>
+      </div>
+
+      <p class="todo-tieback">
+        A moment ago I said I did <em>not</em> improve SIA itself. Here&rsquo;s exactly how I would.
+      </p>
+    </section>
+
+    <!-- Screen 8 — Ongoing TODO (2/2): What would change (two paths + honest cost) -->
+    <section class="screen" data-screen="8" aria-label="Ongoing TODO — what would change">
+      <div class="prose prose--tight">
+        <p class="todo-kicker">How I&rsquo;d build it &middot; the pieces &amp; my choice</p>
+        <h2 class="prose__h">Two ways I could close it &mdash; and which I&rsquo;d pick.</h2>
+      </div>
+
+      <!-- the signal that flows back: a compact credit-assignment table -->
+      <div class="credit">
+        <p class="credit__cap">
+          The signal I&rsquo;d feed back &mdash; each change, <strong>labelled</strong> and
+          <strong>scored against a held-out grader</strong>:
+        </p>
+        <table class="credit__table">
+          <thead>
+            <tr><th>gen</th><th>change (bucket)</th><th>&Delta; train</th><th>&Delta; held-out</th><th>verdict</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>2</td><td>prompt-restructure &middot; schema injection</td><td class="credit__up">+15%</td><td class="credit__up">+14%</td><td class="credit__good">&#10003; genuine</td></tr>
+            <tr><td>3</td><td>retry/robustness &middot; SQL self-repair</td><td class="credit__up">+8%</td><td class="credit__up">+7%</td><td class="credit__good">&#10003; genuine</td></tr>
+            <tr class="credit__hackrow"><td>4</td><td>task-specific-hack</td><td class="credit__up">+5%</td><td class="credit__down">&minus;2%</td><td class="credit__bad">&#10007; reward-hack</td></tr>
+            <tr><td>5</td><td>parser-hardening</td><td>0%</td><td>0%</td><td class="credit__meh">&deg; wasted</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- the two paths, side by side -->
+      <div class="paths">
+        <div class="path path--outside">
+          <div class="path__head">
+            <span class="path__badge path__badge--rec">My pick</span>
+            <h3 class="path__title">Outside-in &mdash; wrap the framework</h3>
+          </div>
+          <p class="path__claim path__claim--yes">Keeps my &ldquo;zero <code>sia/</code> edits&rdquo;.</p>
+          <ul class="path__pieces">
+            <li>a new <code>hackathon_demo/loop/</code> wrapper drives the <code>sia</code> CLI</li>
+            <li>the verdict re-enters via the <strong>task contract</strong> (<code>task.md</code> / a <code>LESSONS.md</code>) &mdash; both agents already read it</li>
+            <li>parent-selection: copy the best <em>clean</em> scaffold into <code>reference/</code> before the next run</li>
+          </ul>
+          <div class="path__chips">
+            <span class="chip chip--good">zero <code>sia/</code> edits</span>
+            <span class="chip chip--good">~1 day</span>
+            <span class="chip">between-gen guard</span>
+          </div>
+        </div>
+
+        <div class="path path--inside">
+          <div class="path__head">
+            <span class="path__badge">Deeper</span>
+            <h3 class="path__title">Inside &mdash; fork the framework</h3>
+          </div>
+          <p class="path__claim path__claim--no">Edits <code>sia/</code> &mdash; spends that property.</p>
+          <ul class="path__pieces">
+            <li>promote the classifier &rarr; <code>sia/improvement_signal.py</code>, called in-loop</li>
+            <li><code>build_feedback_prompt</code> + <code>run_generation</code> + <code>context_manager</code> (orchestrator)</li>
+            <li>a second <strong>held-out</strong> grader in <code>run_evaluation</code></li>
+          </ul>
+          <div class="path__chips">
+            <span class="chip chip--warn">edits <code>sia/</code></span>
+            <span class="chip">mid-run reward-hack guard</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- honest pivot — "My choice" / "The cost" card: COMMENTED OUT (kept, not removed) per request. Remove the wrapping comment markers below to restore. -->
+      <!--
+      <div class="honesty honesty--todo">
+        <div class="honesty__row">
+          <span class="honesty__tag honesty__tag--yes">My choice</span>
+          <p>
+            I&rsquo;d stay decoupled and close the loop from the <strong>outside</strong>, and only
+            <strong>fork</strong> SIA when I want the framework itself to refuse a reward-hack
+            <em>mid-generation</em>.
+          </p>
+        </div>
+        <div class="honesty__row">
+          <span class="honesty__tag">The cost</span>
+          <p>
+            Only the fork spends my &ldquo;zero <code>sia/</code> edits&rdquo; property. The signal,
+            the buckets, and half the selection logic (<code>finalize()</code>&rsquo;s best-gen) are
+            <strong>already built</strong> &mdash; so for me, closing the loop is mostly wiring.
+          </p>
+        </div>
+      </div>
+      -->
+
+      <p class="hook__credit">Team SIA-for-SQL &middot; Applied &#43; Research shipped &mdash; Framework is where I&rsquo;m headed next.</p>
+    </section>
+
+    <!-- Five UI states: Default = the screens above. Loading / Empty / Error are
+         overlays; Partial is an inline banner (the loaded gens still render). -->
+    <div class="overlay" id="overlay-loading" hidden>
+      <div class="overlay__box">
+        <div class="skeleton skeleton--curve"></div>
+        <p class="overlay__hint">Loading run data&hellip;</p>
+      </div>
+    </div>
+    <div class="overlay" id="overlay-empty" hidden>
+      <div class="overlay__box overlay__box--empty">
+        <h3>No run captured yet</h3>
+        <p>Run SIA, then build the demo data, then reload this page:</p>
+        <pre class="overlay__cmd">python -m hackathon_demo.export.flatten --run-dir runs/run_1 \
+  --out hackathon_demo/web/demo_data.json</pre>
+      </div>
+    </div>
+    <div class="overlay" id="overlay-error" hidden>
+      <div class="overlay__box overlay__box--error" id="error-text"></div>
+    </div>
+
+    <!-- Partial: some gens loaded, some are missing data (inline, non-blocking) -->
+    <div class="partial-banner" id="partial-banner" hidden></div>
+  </main>
+
+  <!-- ============================== NAV ============================== -->
+  <footer class="nav">
+    <button class="btn" id="btn-prev" type="button">◂ Prev</button>
+    <div class="nav__jumps">
+      <button class="btn" id="btn-start" type="button">⟲ Start over</button>
+      <button class="btn btn--accent" id="btn-improve" type="button">▸ See it improve</button>
+    </div>
+    <button class="btn" id="btn-next" type="button">Next ▸</button>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

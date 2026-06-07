@@ -226,3 +226,7 @@ runs
 .env
 .env.*
 .env.local
+!.env.example
+
+# Generated demo data (flatten.py output -- rebuilt from runs/, not committed)
+hackathon_demo/web/demo_data*.json

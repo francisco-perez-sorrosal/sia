@@ -1,0 +1,27 @@
+%% One-generation data flow of the built system, then the post-hoc demo build.
+%% Verified against code 2026-06-06: Spider multi-DB grader, gemma-27b target,
+%% Qwen3-30B R2 classifier, flatten -> demo_data.json -> static SPA.
+sequenceDiagram
+    participant Meta as Meta-Agent (Claude sonnet)
+    participant Target as target_agent.py (gemma-27b@Nebius)
+    participant V as evaluate.py (host, multi-DB)
+    participant FB as Feedback-Agent (Claude sonnet)
+    participant FS as runs/run_X/gen_N/
+    participant Fl as flatten.py + R2 (Qwen3-30B)
+    participant Web as static SPA
+
+    Note over Meta,FB: one generation = Execution → Analysis → Improvement
+    Meta->>FS: writes gen_1/target_agent.py (A₁)
+    loop for gen N
+        Target->>Target: NL→SQL call per question (raw openai SDK → Nebius)
+        Target->>FS: writes responses.json (routed by db_id)
+        V->>FS: exec candidate vs gold per db_id (read-only DB)
+        V->>FS: results.json {accuracy 0.0–1.0}
+        FB->>FS: reads accuracy + trajectory (τ_g, E_g)
+        FB->>FS: writes gen_N+1/{improvement.md, target_agent.py} (A_g+1)
+    end
+    Note over Fl,Web: post-hoc, read-only over runs/
+    FS->>Fl: walk gen_* (numeric sort)
+    Fl->>Fl: difflib diff, self-repair regex, R2 classify per change
+    Fl->>Web: demo_data.json (canonical contract + self_repair_gen)
+    Web->>Web: one scrubber morphs curve + diff + taxonomy in sync

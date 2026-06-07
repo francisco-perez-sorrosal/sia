@@ -42,6 +42,10 @@ dev = [
     "ruff>=0.11",
     "httpx>=0.27",  # required by fastapi's TestClient (starlette.testclient)
 ]
+# hackathon_demo/ dev-side deps (R2 classifier + scaffold smoke). The web app is
+# zero-build (CDN) so there is no JS toolchain. `openai` is the dev-side Token Factory
+# client; it also appears in Config.VENV_PACKAGES for the per-run target venv (separate).
+demo = ["openai>=1.40"]
 
 [project.scripts]
 sia = "sia.orchestrator:main"
