@@ -61,7 +61,7 @@ from typing import Any
 from sia import __version__, cli
 from sia.agent_reference import ResolvedAgentReference, copy_reference_into, resolve_agent_reference
 from sia.config import Config
-from sia.context_manager import ContextManager, parse_accuracy
+from sia.context_manager import ContextManager, parse_accuracy, summarize_items
 from sia.io_utils import file_size_ok, write_text
 from sia.layout import BUNDLED_TASKS, Names, RunLayout, TaskLayout, resolve_task_dir, venv_python_path
 from sia.logging_setup import configure_logging, get_logger
@@ -525,6 +525,26 @@ def _build_eval_summary(
     if not isinstance(items, list):
         items = []
 
+    # Lever B — aggregate failure-taxonomy breakdown (reference-answer-free: status/group/
+    # category counts only). Gives the feedback agent the "where failures concentrate" signal
+    # the per-item sample alone (capped) does not. Empty string when disabled or no failures.
+    taxonomy_block = ""
+    if env_config.FAILURE_TAXONOMY and items:
+        summary = summarize_items(items, env_config.VERIFIER_PASS_STATUSES)
+        if summary.get("failures"):
+            top_n = env_config.FAILURE_TAXONOMY_TOP_N
+            status_str = ", ".join(f"{s} ({n})" for s, n in summary.get("status_counts", {}).items())
+            top_groups = sorted(summary.get("group_failure_counts", {}).items(), key=lambda kv: -kv[1])[:top_n]
+            groups_str = ", ".join(f"`{g}` ({n})" for g, n in top_groups)
+            lines = [
+                f"\n\n**Failure breakdown** ({summary['failures']} of {summary.get('total', len(items))} items failed):"
+            ]
+            if status_str:
+                lines.append(f"- by status: {status_str}")
+            if groups_str:
+                lines.append(f"- concentrated in groups (top {top_n}): {groups_str}")
+            taxonomy_block = "\n".join(lines)
+
     failures = _select_failures(items, env_config.VERIFIER_PASS_STATUSES, env_config.FEEDBACK_FAILURE_SAMPLES)
     if failures:
         shown = [_render_item(item) for item in failures]
@@ -536,7 +556,7 @@ def _build_eval_summary(
     else:
         failures_block = "\n\nNo failed held-out items to show (all passed or no per-item detail available)."
 
-    return f"{header}{failures_block}\n\n{_ANTI_REWARD_HACK_FRAMING}"
+    return f"{header}{taxonomy_block}{failures_block}\n\n{_ANTI_REWARD_HACK_FRAMING}"
 
 
 def _build_feedback_context(
