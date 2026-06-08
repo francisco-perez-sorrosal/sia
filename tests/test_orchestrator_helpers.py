@@ -15,6 +15,7 @@ from sia.orchestrator import (
     build_feedback_prompt,
     build_meta_prompt,
     load_agent_execution,
+    load_task_files,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -223,6 +224,139 @@ def test_sql_task_content_files_do_not_reveal_private_path():
     sample_desc = (SQL_TASK_ROOT / "reference" / "SAMPLE_TASK_DESCRIPTIONS.md").read_text(encoding="utf-8")
     assert "data/private" not in task_md
     assert "data/private" not in sample_desc
+
+
+# --- Task-family change library: load + meta-prompt injection -----------------
+
+
+def _scaffold_task_dir(tmp_path, change_library=None):
+    """Create a minimal task dir + shared dir matching TaskLayout for load_task_files."""
+    task_dir = tmp_path / "task"
+    (task_dir / "reference").mkdir(parents=True)
+    (task_dir / "data" / "public").mkdir(parents=True)
+    (task_dir / "reference" / "SAMPLE_TASK_DESCRIPTIONS.md").write_text("desc")
+    (task_dir / "reference" / "reference_target_agent.py").write_text("def main():\n    pass\n")
+    (task_dir / "data" / "public" / "task.md").write_text("task spec")
+    if change_library is not None:
+        (task_dir / "reference" / "change_library.md").write_text(change_library)
+
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    (shared_dir / "sample_agent_execution.json").write_text(json.dumps({"role": "user"}))
+    return str(task_dir), str(shared_dir)
+
+
+def test_load_task_files_populates_change_library_when_present(tmp_path):
+    task_dir, shared_dir = _scaffold_task_dir(tmp_path, change_library="use temperature=0")
+
+    task_files = load_task_files(task_dir, shared_dir)
+
+    assert task_files.change_library == "use temperature=0"
+
+
+def test_load_task_files_leaves_change_library_none_when_absent(tmp_path):
+    task_dir, shared_dir = _scaffold_task_dir(tmp_path, change_library=None)
+
+    task_files = load_task_files(task_dir, shared_dir)
+
+    assert task_files.change_library is None
+
+
+def _task_files_with_library(library):
+    return TaskFiles(
+        sample_task_descriptions="desc",
+        reference_target_agent_py="agent",
+        sample_agent_execution={"role": "user"},
+        task_md="task",
+        change_library=library,
+    )
+
+
+def test_meta_prompt_injects_change_library_block_when_enabled_and_present():
+    prompt = build_meta_prompt(
+        _task_files_with_library("DISTINCT-dedup rule pack"),
+        "some-model",
+        "/work",
+        change_library_enabled=True,
+    )
+
+    assert "TASK-FAMILY CHANGE LIBRARY" in prompt
+    assert "DISTINCT-dedup rule pack" in prompt
+
+
+def test_meta_prompt_omits_change_library_block_when_disabled():
+    """Knob off with a library present must reproduce the no-library baseline byte-for-byte."""
+    baseline = build_meta_prompt(
+        _task_files_with_library(None),
+        "m",
+        "/work",
+        change_library_enabled=True,
+    )
+    knob_off = build_meta_prompt(
+        _task_files_with_library("some library"),
+        "m",
+        "/work",
+        change_library_enabled=False,
+    )
+
+    assert "TASK-FAMILY CHANGE LIBRARY" not in baseline
+    assert knob_off == baseline
+
+
+def test_meta_prompt_omits_change_library_block_when_absent():
+    """Enabled but no library file → no injection, identical to the disabled path."""
+    enabled_absent = build_meta_prompt(
+        _task_files_with_library(None),
+        "m",
+        "/work",
+        change_library_enabled=True,
+    )
+    default_off = build_meta_prompt(
+        _task_files_with_library(None),
+        "m",
+        "/work",
+    )
+
+    assert "TASK-FAMILY CHANGE LIBRARY" not in enabled_absent
+    assert enabled_absent == default_off
+
+
+def test_meta_prompt_change_library_default_is_off():
+    """A caller that does not pass change_library_enabled gets no injection."""
+    prompt = build_meta_prompt(
+        _task_files_with_library("present but not opted in"),
+        "m",
+        "/work",
+    )
+
+    assert "TASK-FAMILY CHANGE LIBRARY" not in prompt
+
+
+def test_meta_prompt_composes_change_library_with_held_out_notice():
+    """Both the change-library block (Lever C) and the held-out notice (Feature 2) present."""
+    prompt = build_meta_prompt(
+        _task_files_with_library("pattern pack"),
+        "m",
+        "/work",
+        change_library_enabled=True,
+    )
+
+    assert "TASK-FAMILY CHANGE LIBRARY" in prompt
+    assert HELD_OUT_GROUND_TRUTH_NOTICE in prompt
+
+
+def test_meta_prompt_weights_mode_ignores_change_library():
+    """Weights mode never injects the change library even when enabled+present."""
+    prompt = build_meta_prompt(
+        _task_files_with_library("pattern pack"),
+        "m",
+        "/work",
+        focus="weights",
+        change_library_enabled=True,
+    )
+
+    assert "TASK-FAMILY CHANGE LIBRARY" not in prompt
+    assert "pattern pack" not in prompt
 
 
 # --- Best-of-N candidate selection (select_best determinism / tiebreak) -------

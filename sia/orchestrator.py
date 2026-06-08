@@ -923,6 +923,7 @@ def _run_meta_candidate(
         task_model,
         cand_dir,
         provider=target_provider,
+        change_library_enabled=env_config.CHANGE_LIBRARY,
     )
     # Salvage-on-authoring-error: a meta-agent that hits max_turns / an API error may
     # already have written a working scaffold. Never let that abort the candidate — fall
@@ -1607,6 +1608,7 @@ def main():
         reference_dir=reference_dir,
         focus=args.focus,
         training_sandbox=args.training_sandbox,
+        change_library_enabled=env_config.CHANGE_LIBRARY,
     )
 
     # ========================

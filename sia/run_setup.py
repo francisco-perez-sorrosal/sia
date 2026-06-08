@@ -37,6 +37,7 @@ class TaskFiles:
     reference_target_agent_py: str
     sample_agent_execution: dict
     task_md: str
+    change_library: str | None = None
 
 
 @dataclass
@@ -80,11 +81,20 @@ def load_task_files(
     task_md = Path(paths.task_md).read_text()
     logger.info("  ✓ Task specification loaded")
 
+    # Optional task-family change library: a curated set of proven, task-FAMILY-level
+    # patterns front-loaded into the meta-agent's gen-1 prompt. Absent file → None →
+    # today's behavior. Located at <reference_dir>/<basename of CHANGE_LIBRARY_PATH>.
+    change_library_file = Path(paths.reference_dir, Path(Config.CHANGE_LIBRARY_PATH).name)
+    change_library = change_library_file.read_text() if change_library_file.is_file() else None
+    if change_library is not None:
+        logger.info("  ✓ Task-family change library loaded")
+
     return TaskFiles(
         sample_task_descriptions=sample_task_descriptions,
         reference_target_agent_py=reference_target_agent_py,
         sample_agent_execution=sample_agent_execution,
         task_md=task_md,
+        change_library=change_library,
     )
 
 

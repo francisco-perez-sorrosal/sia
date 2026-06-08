@@ -628,12 +628,17 @@ def build_meta_prompt(
     reference_dir: str | None = None,
     focus: str = "harness",
     training_sandbox: str = "modal",
+    change_library_enabled: bool = False,
 ) -> str:
     """Build the meta-agent prompt for creating the initial target agent.
 
     Args:
         focus: "harness" (default) for code improvement or "weights" for RL-based tuning
         training_sandbox: "modal" (default) or "sandboxfusion" for train.py code execution
+        change_library_enabled: when True and ``task_files.change_library`` is present,
+            front-load a delimited block of proven task-FAMILY patterns into the gen-1
+            (harness-mode) prompt. Defaults to False so callers that do not opt in get a
+            prompt byte-identical to the original (graceful degradation).
 
     For Anthropic and Google providers (and the default ``None``) the text is
     byte-identical to the original. For OpenAI-compatible providers a client-setup
@@ -645,12 +650,21 @@ def build_meta_prompt(
     reads the files with its own tools. ``None`` (default/single-file) keeps the
     historical embedded-seed text verbatim.
     """
-    # Handle weights mode (RL-based tuning)
+    # Handle weights mode (RL-based tuning). The change library is harness-only and is
+    # never injected here.
     if focus == "weights":
         return _build_weights_meta_prompt(task_files, task_model, working_dir, training_sandbox=training_sandbox)
 
     # Harness mode (default - code/prompt improvement)
     reference_section = _reference_section(task_files, reference_dir)
+    change_library_section = (
+        f"""TASK-FAMILY CHANGE LIBRARY (compose these proven patterns into the gen-1 scaffold):
+{task_files.change_library}
+
+"""
+        if change_library_enabled and task_files.change_library
+        else ""
+    )
     base = f"""You are a meta-agent. Your task is to create a target agent which can execute a task. Go ahead and create a target_agent.py for the target agent, which in turn can solve the given task.
 
 Here is the FULL TASK SPECIFICATION that your target_agent.py will need to solve:
@@ -664,7 +678,7 @@ Here are a couple of sample task descriptions which the target agent has to solv
 Here is a sample agent execution trajectory:
 {json.dumps(task_files.sample_agent_execution, indent=2)}
 
-{HELD_OUT_GROUND_TRUTH_NOTICE}
+{change_library_section}{HELD_OUT_GROUND_TRUTH_NOTICE}
 
 CRITICAL RULES - FOLLOW EXACTLY:
 
