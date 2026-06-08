@@ -213,6 +213,7 @@ task_1/public/data
 
 data
 runs
+tmp/
 
 # AI assistants
 .ai-work/

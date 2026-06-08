@@ -10,7 +10,7 @@ The target agent answers each question by reading its `db_id`, generating one
 SQLite query, and writing it to `responses.json` as
 `{"question_id": "...", "sql": "..."}`. The grader routes each query to its
 `data/public/<db_id>.sqlite` database (read-only) and compares result sets as a
-sorted multiset. The gold SQL is held out in `data/private/gold.json`.
+sorted multiset. Reference answers are held out and used only by the grader.
 
 Each question carries a `db_id`; the six databases differ in schema, so the agent
 must answer against the named database. Bare table names come from that database's

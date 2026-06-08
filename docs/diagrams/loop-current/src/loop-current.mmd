@@ -1,0 +1,19 @@
+%% Current SIA-H loop: strictly sequential, single candidate, base-on-last, signal dropped.
+%% Grounded in sia/orchestrator.py run_generation:791 and sia/context_manager.py.
+graph TD
+    M["Meta-Agent M<br/>build_meta_prompt:463<br/>seeds gen-1 from reference agent"]
+    M --> T["Target Agent<br/>run target subprocess<br/>run_generation:816"]
+    T --> V["Verifier V<br/>run_evaluation:831<br/>results.json (scalar acc)"]
+    V --> A["add_generation:836<br/>keeps scalars only"]
+
+    subgraph drop["signal loss"]
+        D["_extract_metrics:383-385<br/>drops per-item lists"]
+    end
+    V -. per-item detail discarded .-> D
+
+    A --> F["Feedback Agent F<br/>build_feedback_prompt:889<br/>raw results.json + bare<br/>previous-gens list :753"]
+    F --> N["gen N+1 target_agent.py<br/>based on gen N (last)<br/>_run_feedback_agent:750"]
+    N -->|"next generation (sequential)"| T
+
+    style drop fill:#fdd,stroke:#c33
+    style D fill:#fdd,stroke:#c33

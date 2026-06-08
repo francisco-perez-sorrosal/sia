@@ -1,0 +1,28 @@
+%% Amplified SIA-H loop. Solid green edges = NEW vs current; annotated with lever A-E.
+%% Dashed = deferred Plan-2 best-of-N fan-out (Lever A, engage only if Plan 1 misses parity).
+graph TD
+    CL["change_library.md<br/>(per-task family prior)"]
+    CL -->|"NEW · Lever C: front-load"| M["Meta-Agent M<br/>build_meta_prompt:463<br/>gen-1 starts near old gen-3"]
+    M --> T["Target Agent<br/>run target subprocess"]
+    T --> V["Verifier V<br/>run_evaluation:831<br/>+ optional items[] array"]
+
+    V -->|"NEW · Lever B: failure digest"| DG["Failure-taxonomy digest<br/>status/group/category counts<br/>+ worst-N items"]
+    DG --> F["Feedback Agent F<br/>build_feedback_prompt:889<br/>fix top failure cluster first"]
+
+    V --> A["add_generation + scored trajectory<br/>retains bounded items summary"]
+    A -->|"NEW · Lever D: scored credit"| F
+
+    F --> N["gen N+1 target_agent.py"]
+    N -->|"NEW · Lever E: base-on-best + reject-regression"| BEST{{"select best-so-far<br/>argmax acc, not last"}}
+    BEST -->|"next generation"| T
+
+    subgraph plan2["deferred — Plan 2"]
+        BoN["Lever A: best-of-N<br/>K candidate scaffolds<br/>minibatch-rank + full-confirm"]
+    end
+    M -.->|"NEW · Lever A (dashed/deferred)"| BoN
+    BoN -.->|"promote winner"| BEST
+
+    style plan2 fill:#eef,stroke:#88a,stroke-dasharray:5 5
+    style CL fill:#dfd,stroke:#3a3
+    style DG fill:#dfd,stroke:#3a3
+    style BEST fill:#dfd,stroke:#3a3
