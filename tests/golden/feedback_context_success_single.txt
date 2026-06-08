@@ -3,13 +3,16 @@ SUCCESS: Target agent completed execution successfully.
 
 
 **EVALUATION RESULTS**:
-```json
-{
-  "accuracy": 0.9,
-  "correct": 9,
-  "total": 10
-}
-```
+**Held-out eval (scalars)**:
+- accuracy_percent: None
+- correct: 9
+- wrong_answer: None
+- exec_error: None
+- missing: None
+
+No failed held-out items to show (all passed or no per-item detail available).
+
+The held-out reference answers are intentionally withheld. Improve the agent by reasoning about WHY these inputs failed (the failing inputs/outputs above) — never by hardcoding or matching specific answers.
 
 
 **Last 10 lines of output**:

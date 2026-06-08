@@ -51,6 +51,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from sia import __version__, cli
 from sia.agent_reference import ResolvedAgentReference, copy_reference_into, resolve_agent_reference
@@ -59,7 +60,7 @@ from sia.io_utils import file_size_ok, write_text
 from sia.layout import BUNDLED_TASKS, Names, RunLayout, TaskLayout, resolve_task_dir, venv_python_path
 from sia.logging_setup import configure_logging, get_logger
 from sia.profiles import MetaAgentProfile, load_meta_agent_profile, load_target_agent_profile
-from sia.prompts import build_feedback_prompt, build_meta_prompt
+from sia.prompts import HELD_OUT_GROUND_TRUTH_NOTICE, build_feedback_prompt, build_meta_prompt
 from sia.providers import Provider
 from sia.results import FeedbackContext, TargetAgentResult
 from sia.run_setup import RunSetup, TaskFiles, install_requirements, load_task_files, setup_run_directory
@@ -67,6 +68,7 @@ from sia.util import run_agent
 
 __all__ = [
     "BUNDLED_TASKS",
+    "HELD_OUT_GROUND_TRUTH_NOTICE",
     "RunSetup",
     "TaskFiles",
     "build_feedback_prompt",
@@ -436,6 +438,99 @@ def _run_target_agent(
         return TargetAgentResult(False, stdout, "", error_msg).as_tuple()
 
 
+# Generic render whitelist for a single failing eval item. Only these keys reach the
+# feedback prompt — no task-shaped key (e.g. a reference answer carried elsewhere) can
+# ride along.
+_ITEM_RENDER_FIELDS = ("id", "group", "status", "category", "input", "output", "detail")
+
+_ANTI_REWARD_HACK_FRAMING = (
+    "The held-out reference answers are intentionally withheld. Improve the agent by "
+    "reasoning about WHY these inputs failed (the failing inputs/outputs above) — "
+    "never by hardcoding or matching specific answers."
+)
+
+
+def _select_failures(items: list[Any], pass_statuses: tuple[str, ...], max_failures: int) -> list[dict]:
+    """Pick up to `max_failures` FAILED items, diversified across status and group.
+
+    Round-robins over (status, group) buckets so a single dominant status or group
+    cannot crowd out the others — the feedback agent sees a spread of failure modes.
+    Reads only the generic `status` and `group` item keys.
+    """
+    pass_set = set(pass_statuses)
+    buckets: dict[tuple[str, str], list[dict]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        if status in pass_set:
+            continue
+        key = (str(status), str(item.get("group")))
+        buckets.setdefault(key, []).append(item)
+
+    selected: list[dict] = []
+    bucket_lists = list(buckets.values())
+    cursor = 0
+    while len(selected) < max_failures and any(bucket_lists):
+        bucket = bucket_lists[cursor % len(bucket_lists)]
+        if bucket:
+            selected.append(bucket.pop(0))
+        cursor += 1
+        if cursor % len(bucket_lists) == 0:
+            bucket_lists = [b for b in bucket_lists if b]
+            cursor = 0
+    return selected
+
+
+def _render_item(item: dict) -> dict:
+    """Project a failing item onto the generic render whitelist (present keys only).
+
+    Constructs a NEW dict containing only `_ITEM_RENDER_FIELDS` keys that are present
+    in the item — never copies the source dict, so no task-specific key (and no
+    reference answer carried elsewhere) can ride along.
+    """
+    return {field: item[field] for field in _ITEM_RENDER_FIELDS if field in item}
+
+
+def _build_eval_summary(
+    eval_data: dict,
+    env_config: Config,
+) -> str:
+    """Render a curated, reference-answer-free eval summary for the feedback prompt.
+
+    Task-agnostic: reads top-level scalar counts plus the generic `items[]` array ONLY —
+    never `eval_data["results"]` (the task-shaped record that may carry a reference
+    answer). Emits a scalar header, a capped sample of FAILED items diversified across
+    `status` and `group` (each rendered with only the generic `_ITEM_RENDER_FIELDS`
+    present), and an anti-reward-hack framing line.
+    """
+    scalars = (
+        f"- accuracy_percent: {eval_data.get('accuracy_percent')}",
+        f"- correct: {eval_data.get('correct')}",
+        f"- wrong_answer: {eval_data.get('wrong_answer')}",
+        f"- exec_error: {eval_data.get('exec_error')}",
+        f"- missing: {eval_data.get('missing')}",
+    )
+    header = "**Held-out eval (scalars)**:\n" + "\n".join(scalars)
+
+    items = eval_data.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    failures = _select_failures(items, env_config.VERIFIER_PASS_STATUSES, env_config.FEEDBACK_FAILURE_SAMPLES)
+    if failures:
+        shown = [_render_item(item) for item in failures]
+        failures_block = (
+            f"\n\n**Sample of FAILED held-out items** "
+            f"(up to {env_config.FEEDBACK_FAILURE_SAMPLES}, diversified across status and group):\n"
+            f"```json\n{json.dumps(shown, indent=2)}\n```"
+        )
+    else:
+        failures_block = "\n\nNo failed held-out items to show (all passed or no per-item detail available)."
+
+    return f"{header}{failures_block}\n\n{_ANTI_REWARD_HACK_FRAMING}"
+
+
 def _build_feedback_context(
     current_gen: int,
     gen_dir: str,
@@ -518,12 +613,14 @@ NOTE: If you see an "error" field in the above JSON, it means the execution log 
             else:
                 with open(results_json_path, encoding="utf-8") as f:
                     eval_data = json.load(f)
+                # Curated, gold-free summary — the full results dump leaked every
+                # held-out reference answer to the feedback agent (reward-hacking
+                # surface + turn pressure). Reads only the generic `items[]` contract.
+                eval_summary = _build_eval_summary(eval_data, cfg)
                 eval_results_section = f"""
 
 **EVALUATION RESULTS**:
-```json
-{json.dumps(eval_data, indent=2)}
-```
+{eval_summary}
 """
         except (json.JSONDecodeError, OSError) as e:
             eval_results_section = f"\n**EVALUATION RESULTS**: Error loading results.json: {e}\n"
