@@ -46,9 +46,14 @@ import asyncio
 import glob
 import json
 import os
+import random
+import shutil
 import subprocess
 import time
 import traceback
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -56,6 +61,7 @@ from typing import Any
 from sia import __version__, cli
 from sia.agent_reference import ResolvedAgentReference, copy_reference_into, resolve_agent_reference
 from sia.config import Config
+from sia.context_manager import ContextManager, parse_accuracy
 from sia.io_utils import file_size_ok, write_text
 from sia.layout import BUNDLED_TASKS, Names, RunLayout, TaskLayout, resolve_task_dir, venv_python_path
 from sia.logging_setup import configure_logging, get_logger
@@ -69,6 +75,7 @@ from sia.util import run_agent
 __all__ = [
     "BUNDLED_TASKS",
     "HELD_OUT_GROUND_TRUTH_NOTICE",
+    "Candidate",
     "RunSetup",
     "TaskFiles",
     "build_feedback_prompt",
@@ -80,6 +87,7 @@ __all__ = [
     "resolve_task_dir",
     "run_evaluation",
     "run_generation",
+    "select_best",
     "setup_run_directory",
 ]
 
@@ -677,14 +685,20 @@ def _run_feedback_agent(
     target_provider: Provider,
     focus: str = "harness",
     resolved_ref: ResolvedAgentReference | None = None,
+    base_gen: int | None = None,
 ) -> None:
     """Run the feedback agent to create an improved target agent or train.py.
 
     Args:
         focus: "harness" (default) for code improvement or "weights" for RL-based tuning
+        base_gen: which generation's ``target_agent.py`` to evolve from. When None
+            (default), evolves from ``current_gen`` (byte-identical to today). Base-on-best
+            routing passes the best-so-far generation instead. Harness-mode only; weights
+            mode ignores it (its agent file is read by focus below).
     """
     # Read the appropriate agent file based on focus mode
-    gen_dir = os.path.join(run_dir, f"gen_{current_gen}")
+    source_gen = current_gen if (base_gen is None or focus == "weights") else base_gen
+    gen_dir = os.path.join(run_dir, f"gen_{source_gen}")
     if focus == "weights":
         agent_file = os.path.join(gen_dir, Names.TRAIN_SCRIPT)
     else:
@@ -747,6 +761,513 @@ def _run_feedback_agent(
     logger.info(f"Feedback agent completed. Created improved agent for generation {next_gen}")
 
 
+# ========================
+# BEST-OF-N (harness-only): parallel candidate execution + selection
+# ========================
+
+
+@dataclass
+class Candidate:
+    """One best-of-N candidate scaffold: its directory name and evaluated accuracy.
+
+    `accuracy` is None when the candidate produced no parseable score; `code_size` is
+    the byte length of its `target_agent.py` (used only as a tie-break).
+    """
+
+    name: str
+    accuracy: float | None
+    code_size: int
+
+
+def select_best(
+    candidates: list[Candidate],
+    *,
+    selection: str = "accuracy",
+    tiebreak: str = "smaller_code",
+    minibatch_frac: float | None = None,
+) -> Candidate:
+    """Pick the winning candidate by verifier accuracy, smaller-code on a tie.
+
+    v1 evaluates every candidate on the full set and selects argmax accuracy directly.
+    Candidates with no parseable accuracy rank below any scored candidate; the
+    smaller-code tie-break breaks accuracy ties, and original list order is the final
+    deterministic tie-break. With a single candidate (or all-None accuracies) the
+    defined fallback is the first candidate — never raises.
+
+    `selection`/`tiebreak` name the active policy (today only the defaults are wired);
+    `minibatch_frac` is reserved for a later minibatch-rank follow-up and is ignored in
+    v1 — its presence keeps the signature forward-compatible without rework.
+    """
+    if not candidates:
+        raise ValueError("select_best requires at least one candidate")
+
+    if all(candidate.accuracy is None for candidate in candidates):
+        # No verifier signal anywhere -> the defined fallback is first-by-order, with no
+        # smaller-code reordering (code size only matters to break a real accuracy tie).
+        return candidates[0]
+
+    def sort_key(indexed: tuple[int, Candidate]) -> tuple[int, float, int, int]:
+        index, candidate = indexed
+        scored = candidate.accuracy is not None
+        accuracy = candidate.accuracy if scored else 0.0
+        # Sort descending on (has-score, accuracy), ascending on (code_size, order):
+        # negate the maximize dimensions so a plain min() yields the winner.
+        return (0 if scored else 1, -accuracy, candidate.code_size, index)
+
+    return min(enumerate(candidates), key=sort_key)[1]
+
+
+def _read_candidate_accuracy(cand_dir: str) -> float | None:
+    """Read a candidate's evaluated accuracy from its results.json (None if unscored)."""
+    results_path = os.path.join(cand_dir, Names.RESULTS_JSON)
+    if not os.path.exists(results_path):
+        return None
+    try:
+        with open(results_path, encoding="utf-8") as f:
+            results = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(results, dict):
+        return None
+    return parse_accuracy(results.get("accuracy"))
+
+
+def _make_candidate_record(cand_dir: str) -> Candidate:
+    """Build a Candidate from a produced+evaluated candidate directory."""
+    agent_path = os.path.join(cand_dir, Names.TARGET_AGENT)
+    code_size = os.path.getsize(agent_path) if os.path.exists(agent_path) else 0
+    return Candidate(
+        name=os.path.basename(cand_dir),
+        accuracy=_read_candidate_accuracy(cand_dir),
+        code_size=code_size,
+    )
+
+
+# Artifacts promoted from a winning candidate dir up to its parent generation dir, so
+# all downstream code reads gen_N/ exactly as in the single-candidate path. The set must
+# mirror everything a normal target-run + evaluation would otherwise produce in gen_N/,
+# because the promoted generation is reused directly (no re-run) when BEST_OF_N > 1.
+# `responses.json` has no layout.Names constant (it is a task-specific run artifact) so it
+# stays a literal here; everything else routes through Names to survive upstream renames.
+_PROMOTED_FILES = (
+    Names.TARGET_AGENT,
+    Names.RESULTS_JSON,
+    "responses.json",
+    Names.IMPROVEMENT_MD,
+    Names.STDOUT_LOG,
+)
+_PROMOTED_DIRS = (Names.AGENT_EXECUTION_DIR,)
+
+
+def _promote_candidate(winner_dir: str, dest_dir: str) -> None:
+    """Copy a winning candidate's artifacts up into its parent generation directory.
+
+    Files and the multi-trajectory execution dir are copied (overwriting) so downstream
+    code (add_generation, _build_feedback_context, best_generation) reads dest_dir as
+    today — the candidate machinery stays invisible above the promotion boundary.
+    """
+    for filename in _PROMOTED_FILES:
+        src = os.path.join(winner_dir, filename)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dest_dir, filename))
+    for dirname in _PROMOTED_DIRS:
+        src = os.path.join(winner_dir, dirname)
+        if os.path.isdir(src):
+            dest = os.path.join(dest_dir, dirname)
+            if os.path.isdir(dest):
+                shutil.rmtree(dest)
+            shutil.copytree(src, dest)
+
+
+def _run_meta_candidate(
+    cand_dir: str,
+    task_files: TaskFiles,
+    task_model: str,
+    meta_profile: MetaAgentProfile,
+    venv_dir: str,
+    abs_dataset_dir: str,
+    dataset_dir: str,
+    sandbox: str,
+    env_config: Config,
+    target_provider: Provider,
+    protected_paths: list[str] | None = None,
+) -> Candidate:
+    """Produce + run + evaluate one gen-1 meta-agent candidate scaffold.
+
+    The meta-agent writes target_agent.py into cand_dir, which is then executed and
+    graded so the candidate carries a verifier accuracy for selection.
+    """
+    os.makedirs(cand_dir, exist_ok=True)
+    meta_prompt = build_meta_prompt(
+        task_files,
+        task_model,
+        cand_dir,
+        provider=target_provider,
+    )
+    # Salvage-on-authoring-error: a meta-agent that hits max_turns / an API error may
+    # already have written a working scaffold. Never let that abort the candidate — fall
+    # through to run + evaluate whatever exists (yielding a None-accuracy record if nothing
+    # usable was written). This makes _run_meta_candidate non-raising.
+    try:
+        asyncio.run(
+            run_agent(
+                model_name=meta_profile.model,
+                max_turns=str(env_config.DEFAULT_MAX_TURNS),
+                prompt=meta_prompt,
+                agent_working_directory=cand_dir,
+                agent_impl=meta_profile.agent_impl,
+                provider=meta_profile.provider,
+                protected_paths=protected_paths,
+            )
+        )
+    except Exception as e:
+        logger.error(
+            "candidate %s authoring error (salvaging any scaffold): %s",
+            os.path.basename(cand_dir),
+            e,
+        )
+    target_agent_path = os.path.join(cand_dir, Names.TARGET_AGENT)
+    stdout_log_file = os.path.join(cand_dir, Names.STDOUT_LOG)
+    _run_target_agent(
+        venv_dir=venv_dir,
+        target_agent_path=target_agent_path,
+        abs_dataset_dir=abs_dataset_dir,
+        gen_dir=cand_dir,
+        stdout_log_file=stdout_log_file,
+        sandbox=sandbox,
+        env_config=env_config,
+    )
+    run_evaluation(cand_dir, dataset_dir, venv_dir, config=env_config)
+    return _make_candidate_record(cand_dir)
+
+
+def _run_candidates_concurrently(
+    factories: list[Callable[[], Candidate]],
+    *,
+    concurrency: int,
+    stagger_seconds: float,
+) -> list[Candidate]:
+    """Run K best-of-N candidate factories, returning their Candidates in index order.
+
+    Each factory is a zero-arg closure that produces, runs, and evaluates one candidate
+    (binding its own `cand_dir`). Because candidate work is I/O-bound (subprocess + API
+    waits release the GIL) and each factory wraps its authoring in `asyncio.run(...)` in
+    a fresh per-thread event loop, threads are the right tool here — and the existing sync
+    candidate functions stay untouched.
+
+    Concurrency semantics:
+      - `concurrency <= 0` -> run all K in parallel.
+      - effective == 1     -> sequential plain loop (no executor); preserves today's exact
+                              behavior and is the debug/escape-hatch path.
+      - otherwise          -> ThreadPoolExecutor(max_workers=effective), staggering each
+                              submission by `stagger_seconds` + uniform jitter to desync
+                              API bursts (anti-thundering-herd).
+
+    Results are gathered into a fixed-size list by index, so `select_best`'s deterministic
+    tie-break is identical whether run sequentially or concurrently — completion order
+    never leaks into the result ordering. The candidate factories are already non-raising;
+    a future that still raises is caught here (defense-in-depth) and recorded as a
+    None-accuracy candidate rather than aborting the whole gather.
+
+    Raises RuntimeError only when EVERY candidate produced no scorable scaffold (all
+    accuracies None) — the single fatal case, replacing "any candidate error kills the run".
+    """
+    n = len(factories)
+    effective = n if concurrency <= 0 else min(concurrency, n)
+
+    results: list[Candidate | None] = [None] * n
+
+    if effective == 1:
+        for i, factory in enumerate(factories):
+            results[i] = factory()
+    else:
+        with ThreadPoolExecutor(max_workers=effective) as pool:
+            future_to_index: dict = {}
+            for i, factory in enumerate(factories):
+                if i > 0 and stagger_seconds > 0:
+                    time.sleep(stagger_seconds + random.uniform(0, stagger_seconds))
+                future_to_index[pool.submit(factory)] = i
+            for future in as_completed(future_to_index):
+                i = future_to_index[future]
+                try:
+                    results[i] = future.result()
+                except Exception as e:
+                    logger.error("candidate cand_%d gather error (recording as unscored): %s", i, e)
+                    results[i] = Candidate(name=f"cand_{i}", accuracy=None, code_size=0)
+
+    candidates = [
+        c if c is not None else Candidate(name=f"cand_{i}", accuracy=None, code_size=0) for i, c in enumerate(results)
+    ]
+
+    if all(c.accuracy is None for c in candidates):
+        raise RuntimeError(f"All {n} best-of-N candidates failed to produce a scored scaffold")
+
+    return candidates
+
+
+def _run_gen1_best_of_n(
+    run_setup: RunSetup,
+    task_files: TaskFiles,
+    task_model: str,
+    meta_profile: MetaAgentProfile,
+    abs_dataset_dir: str,
+    dataset_dir: str,
+    sandbox: str,
+    env_config: Config,
+    target_provider: Provider,
+    protected_paths: list[str] | None = None,
+) -> None:
+    """Produce K gen-1 meta-agent candidates, then promote the verifier-best to gen_1/.
+
+    Only entered when BEST_OF_N > 1 (harness mode); the K=1 path stays in main() unchanged.
+    Candidates run concurrently (subject to BEST_OF_N_CONCURRENCY), gathered in index order
+    so selection stays deterministic. The winner's artifacts are copied up into gen_1/ so the
+    main loop (which reads gen_1/) is unchanged.
+    """
+    gen1_dir = run_setup.meta_agent_working_directory
+
+    def _make_factory(i: int) -> Callable[[], Candidate]:
+        cand_dir = os.path.join(gen1_dir, f"cand_{i}")
+
+        def _factory() -> Candidate:
+            candidate = _run_meta_candidate(
+                cand_dir=cand_dir,
+                task_files=task_files,
+                task_model=task_model,
+                meta_profile=meta_profile,
+                venv_dir=run_setup.venv_dir,
+                abs_dataset_dir=abs_dataset_dir,
+                dataset_dir=dataset_dir,
+                sandbox=sandbox,
+                env_config=env_config,
+                target_provider=target_provider,
+                protected_paths=protected_paths,
+            )
+            logger.info(f"  Best-of-N gen-1 candidate {candidate.name}: accuracy={candidate.accuracy}")
+            return candidate
+
+        return _factory
+
+    factories = [_make_factory(i) for i in range(env_config.BEST_OF_N)]
+    candidates = _run_candidates_concurrently(
+        factories,
+        concurrency=env_config.BEST_OF_N_CONCURRENCY,
+        stagger_seconds=env_config.BEST_OF_N_STAGGER_SECONDS,
+    )
+
+    winner = select_best(
+        candidates,
+        selection=env_config.BEST_OF_N_SELECTION,
+        tiebreak=env_config.BEST_OF_N_TIEBREAK,
+    )
+    logger.info(f"  Best-of-N gen-1 winner: {winner.name} (accuracy={winner.accuracy})")
+    _promote_candidate(os.path.join(gen1_dir, winner.name), gen1_dir)
+
+
+def _select_base_generation(context_mgr: ContextManager, current_gen: int, base_on_best: bool) -> int:
+    """Choose which generation the feedback agent should build on.
+
+    When `base_on_best` is on and a best-so-far generation exists, return its number so
+    the next generation evolves from the strongest agent rather than the most recent.
+    Otherwise (knob off, or no scored generation yet) return `current_gen` — today's
+    behavior.
+    """
+    if not base_on_best:
+        return current_gen
+    best = context_mgr.best_generation()
+    if best is None:
+        return current_gen
+    return best["gen_num"]
+
+
+def _is_regression(context_mgr: ContextManager, current_gen: int) -> bool:
+    """True when the current generation scored below the best earlier generation.
+
+    Compares the current generation's accuracy against the best accuracy among strictly
+    earlier generations. Returns False when either side lacks a parseable accuracy (no
+    evidence of regression) — graceful degradation.
+    """
+    current_acc = None
+    best_prior = -float("inf")
+    for g in context_mgr.generations:
+        acc = parse_accuracy(g["metrics"].get("accuracy"))
+        if acc is None:
+            continue
+        if g["gen_num"] == current_gen:
+            current_acc = acc
+        elif g["gen_num"] < current_gen:
+            best_prior = max(best_prior, acc)
+    if current_acc is None or best_prior == -float("inf"):
+        return False
+    return current_acc < best_prior
+
+
+def _run_feedback_candidate(
+    cand_dir: str,
+    current_gen: int,
+    max_gen: int,
+    run_dir: str,
+    task_files: TaskFiles,
+    execution_status: str,
+    execution_section: str,
+    meta_profile: MetaAgentProfile,
+    venv_dir: str,
+    abs_dataset_dir: str,
+    dataset_dir: str,
+    sandbox: str,
+    env_config: Config,
+    task_model: str,
+    target_provider: Provider,
+    base_gen: int | None,
+    resolved_ref: ResolvedAgentReference | None = None,
+    protected_paths: list[str] | None = None,
+) -> Candidate:
+    """Produce + run + evaluate one gen>=2 feedback-agent candidate scaffold.
+
+    The feedback agent evolves `base_gen`'s target_agent.py into a new one written into
+    cand_dir, which is then executed and graded so the candidate carries a verifier
+    accuracy for selection. Mirrors `_run_meta_candidate` for the gen-1 path.
+    """
+    # Salvage-on-authoring-error: a feedback agent that hits max_turns / an API error may
+    # already have written an improved scaffold. Never let that abort the candidate — fall
+    # through to run + evaluate whatever exists (yielding a None-accuracy record if nothing
+    # usable was written). This makes _run_feedback_candidate non-raising.
+    try:
+        _run_feedback_agent(
+            current_gen=current_gen,
+            max_gen=max_gen,
+            run_dir=run_dir,
+            next_gen_dir=cand_dir,
+            task_files=task_files,
+            execution_status=execution_status,
+            execution_section=execution_section,
+            meta_profile=meta_profile,
+            env_config=env_config,
+            dataset_dir=dataset_dir,
+            task_model=task_model,
+            target_provider=target_provider,
+            resolved_ref=resolved_ref,
+            base_gen=base_gen,
+        )
+    except Exception as e:
+        logger.error(
+            "candidate %s authoring error (salvaging any scaffold): %s",
+            os.path.basename(cand_dir),
+            e,
+        )
+    target_agent_path = os.path.join(cand_dir, Names.TARGET_AGENT)
+    stdout_log_file = os.path.join(cand_dir, Names.STDOUT_LOG)
+    _run_target_agent(
+        venv_dir=venv_dir,
+        target_agent_path=target_agent_path,
+        abs_dataset_dir=abs_dataset_dir,
+        gen_dir=cand_dir,
+        stdout_log_file=stdout_log_file,
+        sandbox=sandbox,
+        env_config=env_config,
+    )
+    run_evaluation(cand_dir, dataset_dir, venv_dir, config=env_config)
+    return _make_candidate_record(cand_dir)
+
+
+def _run_gen_n_best_of_n(
+    current_gen: int,
+    max_gen: int,
+    run_setup: RunSetup,
+    next_gen_dir: str,
+    task_files: TaskFiles,
+    execution_status: str,
+    execution_section: str,
+    meta_profile: MetaAgentProfile,
+    abs_dataset_dir: str,
+    dataset_dir: str,
+    sandbox: str,
+    env_config: Config,
+    task_model: str,
+    target_provider: Provider,
+    base_gen: int | None,
+    resolved_ref: ResolvedAgentReference | None = None,
+    protected_paths: list[str] | None = None,
+) -> None:
+    """Produce K feedback-agent candidates, then promote the verifier-best to next_gen_dir.
+
+    Only entered when BEST_OF_N > 1 (harness mode); the K=1 path stays in run_generation
+    unchanged. Candidates run concurrently (subject to BEST_OF_N_CONCURRENCY), gathered in
+    index order so selection stays deterministic. Because selecting the best of K already
+    rejects a bad draw, this subsumes reject-regression re-prompting (no extra attempt loop).
+    Base-on-best still chooses which generation each candidate evolves from (`base_gen`). The
+    winner's artifacts are copied up into next_gen_dir so the main loop (which reads
+    gen_{next}/) is unchanged.
+    """
+
+    def _make_factory(i: int) -> Callable[[], Candidate]:
+        cand_dir = os.path.join(next_gen_dir, f"cand_{i}")
+
+        def _factory() -> Candidate:
+            os.makedirs(cand_dir, exist_ok=True)
+            candidate = _run_feedback_candidate(
+                cand_dir=cand_dir,
+                current_gen=current_gen,
+                max_gen=max_gen,
+                run_dir=run_setup.run_directory,
+                task_files=task_files,
+                execution_status=execution_status,
+                execution_section=execution_section,
+                meta_profile=meta_profile,
+                venv_dir=run_setup.venv_dir,
+                abs_dataset_dir=abs_dataset_dir,
+                dataset_dir=dataset_dir,
+                sandbox=sandbox,
+                env_config=env_config,
+                task_model=task_model,
+                target_provider=target_provider,
+                base_gen=base_gen,
+                resolved_ref=resolved_ref,
+                protected_paths=protected_paths,
+            )
+            logger.info(f"  Best-of-N gen-{current_gen + 1} candidate {candidate.name}: accuracy={candidate.accuracy}")
+            return candidate
+
+        return _factory
+
+    factories = [_make_factory(i) for i in range(env_config.BEST_OF_N)]
+    candidates = _run_candidates_concurrently(
+        factories,
+        concurrency=env_config.BEST_OF_N_CONCURRENCY,
+        stagger_seconds=env_config.BEST_OF_N_STAGGER_SECONDS,
+    )
+
+    winner = select_best(
+        candidates,
+        selection=env_config.BEST_OF_N_SELECTION,
+        tiebreak=env_config.BEST_OF_N_TIEBREAK,
+    )
+    logger.info(f"  Best-of-N gen-{current_gen + 1} winner: {winner.name} (accuracy={winner.accuracy})")
+    _promote_candidate(os.path.join(next_gen_dir, winner.name), next_gen_dir)
+
+
+def _reuse_promoted_generation(gen_dir: str, stdout_log_file: str) -> tuple[bool, str, str, str]:
+    """Reconstruct the run-status tuple for a best-of-N-promoted generation.
+
+    When BEST_OF_N > 1 the generation's scaffold was already produced AND evaluated as a
+    candidate, then promoted into gen_dir. Re-running + re-evaluating it here would discard
+    best-of-N's selection (the chosen winner re-scored under model nondeterminism) and
+    corrupt base-on-best ranking. So we reuse the promoted artifacts instead: success is
+    inferred from the presence of a parseable results.json (evaluation completed), and the
+    captured stdout is read back from the promoted log.
+    """
+    success = _read_candidate_accuracy(gen_dir) is not None
+    target_agent_stdout = ""
+    if os.path.exists(stdout_log_file):
+        try:
+            with open(stdout_log_file, encoding="utf-8") as f:
+                target_agent_stdout = f.read()
+        except OSError:
+            target_agent_stdout = ""
+    error_msg = "" if success else "Promoted generation has no parseable results.json"
+    return success, target_agent_stdout, "", error_msg
+
+
 def run_generation(
     current_gen: int,
     max_gen: int,
@@ -773,42 +1294,55 @@ def run_generation(
     layout = RunLayout(run_dir)
     gen_dir = layout.gen_dir(current_gen)
 
+    # Best-of-N (BEST_OF_N > 1) is harness-only; weights mode keeps the single-candidate path.
+    best_of_n_active = env_config.BEST_OF_N > 1 and focus == "harness"
+
     # Use train.py for weights mode (RL tuning), target_agent.py for harness mode
     target_agent_path = os.path.join(gen_dir, "train.py") if focus == "weights" else layout.target_agent(current_gen)
 
     stdout_log_file = layout.stdout_log(current_gen, focus=focus)
 
-    logger.info(f"Running target agent: {target_agent_path}")
-    logger.info(f"  → Stdout log: {stdout_log_file}")
-    logger.info(f"  → Focus mode: {focus}")
-    logger.info("=" * 60)
-
-    # Install this generation's declared dependencies (if the agent wrote a
-    # requirements.txt) before running the target agent.
-    gen_requirements = os.path.join(gen_dir, Names.REQUIREMENTS_TXT)
-    if os.path.isfile(gen_requirements):
-        install_requirements(run_setup.venv_dir, gen_requirements)
-
     generation_start_time = time.time()
 
-    # Run target agent
-    target_agent_success, target_agent_stdout, target_agent_stderr, target_agent_error_msg = _run_target_agent(
-        venv_dir=run_setup.venv_dir,
-        target_agent_path=target_agent_path,
-        abs_dataset_dir=abs_dataset_dir,
-        gen_dir=gen_dir,
-        stdout_log_file=stdout_log_file,
-        sandbox=sandbox,
-        env_config=env_config,
-    )
+    if best_of_n_active:
+        # This generation was already produced AND evaluated as a promoted best-of-N
+        # candidate (gen-1 via _run_gen1_best_of_n, gen>=2 via the prior generation's
+        # _run_gen_n_best_of_n). Re-running would discard the selected winner's accuracy
+        # under model nondeterminism, so reuse the promoted artifacts instead.
+        logger.info(f"Best-of-N: reusing promoted generation {current_gen} artifacts (skipping re-run + re-eval)")
+        target_agent_success, target_agent_stdout, target_agent_stderr, target_agent_error_msg = (
+            _reuse_promoted_generation(gen_dir, stdout_log_file)
+        )
+    else:
+        logger.info(f"Running target agent: {target_agent_path}")
+        logger.info(f"  → Stdout log: {stdout_log_file}")
+        logger.info(f"  → Focus mode: {focus}")
+        logger.info("=" * 60)
+
+        # Install this generation's declared dependencies (if the agent wrote a
+        # requirements.txt) before running the target agent.
+        gen_requirements = os.path.join(gen_dir, Names.REQUIREMENTS_TXT)
+        if os.path.isfile(gen_requirements):
+            install_requirements(run_setup.venv_dir, gen_requirements)
+
+        # Run target agent
+        target_agent_success, target_agent_stdout, target_agent_stderr, target_agent_error_msg = _run_target_agent(
+            venv_dir=run_setup.venv_dir,
+            target_agent_path=target_agent_path,
+            abs_dataset_dir=abs_dataset_dir,
+            gen_dir=gen_dir,
+            stdout_log_file=stdout_log_file,
+            sandbox=sandbox,
+            env_config=env_config,
+        )
+
+        # Run evaluation (if evaluate.py exists)
+        logger.info("=" * 60)
+        logger.info("Running evaluation (if available)...")
+        run_evaluation(gen_dir, dataset_dir, run_setup.venv_dir, config=env_config)
+        logger.info("=" * 60)
 
     generation_duration = time.time() - generation_start_time
-
-    # Run evaluation (if evaluate.py exists)
-    logger.info("=" * 60)
-    logger.info("Running evaluation (if available)...")
-    run_evaluation(gen_dir, dataset_dir, run_setup.venv_dir, config=env_config)
-    logger.info("=" * 60)
 
     # Add generation to context
     improvement_md_path = layout.improvement_md(current_gen)
@@ -848,22 +1382,70 @@ def run_generation(
         next_gen = current_gen + 1
         next_gen_directory = layout.gen_dir(next_gen)
 
-        _run_feedback_agent(
-            current_gen=current_gen,
-            max_gen=max_gen,
-            run_dir=run_dir,
-            next_gen_dir=next_gen_directory,
-            task_files=task_files,
-            execution_status=execution_status,
-            execution_section=execution_section,
-            meta_profile=meta_profile,
-            env_config=env_config,
-            dataset_dir=dataset_dir,
-            task_model=task_model,
-            target_provider=target_provider,
-            focus=focus,
-            resolved_ref=resolved_ref,
-        )
+        # Base-on-best (harness-only): evolve from the strongest generation so far rather
+        # than the most recent. In weights mode base_gen stays current_gen (no-op routing).
+        context_mgr = run_setup.context_mgr
+        base_gen = current_gen
+        if focus == "harness":
+            base_gen = _select_base_generation(context_mgr, current_gen, env_config.BASE_ON_BEST)
+            if base_gen != current_gen:
+                logger.info(f"  Base-on-best: evolving from generation {base_gen} (best so far), not {current_gen}")
+
+        if not best_of_n_active:
+            # K==1 (or weights mode): reject-regression may give the feedback agent extra
+            # attempts when the current generation scored below an earlier one. Disabled
+            # knob -> a single attempt (byte-identical to upstream).
+            max_attempts = 1
+            if focus == "harness" and env_config.REJECT_REGRESSION and _is_regression(context_mgr, current_gen):
+                max_attempts += max(0, env_config.REGRESSION_REPROMPT_MAX)
+                logger.info(
+                    f"  Reject-regression: generation {current_gen} regressed; up to {max_attempts} feedback attempts"
+                )
+
+            feedback_base_gen = base_gen if focus == "harness" else None
+            for attempt in range(max_attempts):
+                if attempt > 0:
+                    logger.info(f"  Reject-regression re-prompt attempt {attempt + 1}/{max_attempts}")
+                _run_feedback_agent(
+                    current_gen=current_gen,
+                    max_gen=max_gen,
+                    run_dir=run_dir,
+                    next_gen_dir=next_gen_directory,
+                    task_files=task_files,
+                    execution_status=execution_status,
+                    execution_section=execution_section,
+                    meta_profile=meta_profile,
+                    env_config=env_config,
+                    dataset_dir=dataset_dir,
+                    task_model=task_model,
+                    target_provider=target_provider,
+                    focus=focus,
+                    resolved_ref=resolved_ref,
+                    base_gen=feedback_base_gen,
+                )
+        else:
+            # Best-of-N (K>1, harness): sample K feedback candidates and promote the
+            # verifier-best. Selecting the best of K already rejects regressors, so the
+            # reject-regression re-prompt loop is subsumed; base-on-best still chooses
+            # each candidate's base generation.
+            _run_gen_n_best_of_n(
+                current_gen=current_gen,
+                max_gen=max_gen,
+                run_setup=run_setup,
+                next_gen_dir=next_gen_directory,
+                task_files=task_files,
+                execution_status=execution_status,
+                execution_section=execution_section,
+                meta_profile=meta_profile,
+                abs_dataset_dir=abs_dataset_dir,
+                dataset_dir=dataset_dir,
+                sandbox=sandbox,
+                env_config=env_config,
+                task_model=task_model,
+                target_provider=target_provider,
+                base_gen=base_gen,
+                resolved_ref=resolved_ref,
+            )
     else:
         logger.info(f"Generation {current_gen} is the final generation. Skipping feedback agent.")
 
@@ -1016,17 +1598,33 @@ def main():
     write_text(meta_agent_prompt_path, meta_agent_prompt)
     logger.info(f"  ✓ Saved meta-agent prompt to: {meta_agent_prompt_path}")
 
-    asyncio.run(
-        run_agent(
-            model_name=meta_model,
-            max_turns=str(env_config.DEFAULT_MAX_TURNS),
-            prompt=meta_agent_prompt,
-            agent_working_directory=run_setup.meta_agent_working_directory,
-            agent_impl=agent_impl,
-            provider=meta_profile.provider,
+    # Best-of-N (BEST_OF_N > 1) is harness-only; weights mode keeps the single-candidate path.
+    if env_config.BEST_OF_N > 1 and args.focus == "harness":
+        logger.info(f"Best-of-N: producing {env_config.BEST_OF_N} gen-1 meta-agent candidates")
+        _run_gen1_best_of_n(
+            run_setup=run_setup,
+            task_files=task_files,
+            task_model=task_model,
+            meta_profile=meta_profile,
+            abs_dataset_dir=task_layout.abs_dataset_dir,
+            dataset_dir=task_layout.dataset_dir,
+            sandbox=args.sandbox,
+            env_config=env_config,
+            target_provider=target_provider,
             protected_paths=compute_protected_paths(task_dir),
         )
-    )
+    else:
+        asyncio.run(
+            run_agent(
+                model_name=meta_model,
+                max_turns=str(env_config.DEFAULT_MAX_TURNS),
+                prompt=meta_agent_prompt,
+                agent_working_directory=run_setup.meta_agent_working_directory,
+                agent_impl=agent_impl,
+                provider=meta_profile.provider,
+                protected_paths=compute_protected_paths(task_dir),
+            )
+        )
 
     # ========================
     # SECTION 5: Main Loop - Run Target Agent and Feedback Agent

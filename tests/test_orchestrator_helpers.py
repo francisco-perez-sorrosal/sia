@@ -223,3 +223,86 @@ def test_sql_task_content_files_do_not_reveal_private_path():
     sample_desc = (SQL_TASK_ROOT / "reference" / "SAMPLE_TASK_DESCRIPTIONS.md").read_text(encoding="utf-8")
     assert "data/private" not in task_md
     assert "data/private" not in sample_desc
+
+
+# --- Best-of-N candidate selection (select_best determinism / tiebreak) -------
+
+
+def _candidate(name, accuracy, code_size):
+    from sia.orchestrator import Candidate
+
+    return Candidate(name=name, accuracy=accuracy, code_size=code_size)
+
+
+def test_select_best_returns_highest_accuracy():
+    from sia.orchestrator import select_best
+
+    candidates = [
+        _candidate("cand_0", 70.0, 100),
+        _candidate("cand_1", 85.0, 200),
+        _candidate("cand_2", 80.0, 50),
+    ]
+    assert select_best(candidates).name == "cand_1"
+
+
+def test_select_best_breaks_accuracy_tie_with_smaller_code():
+    from sia.orchestrator import select_best
+
+    candidates = [
+        _candidate("cand_0", 85.0, 300),
+        _candidate("cand_1", 85.0, 120),
+        _candidate("cand_2", 85.0, 250),
+    ]
+    assert select_best(candidates).name == "cand_1"
+
+
+def test_select_best_full_tie_is_deterministic_by_order():
+    from sia.orchestrator import select_best
+
+    candidates = [
+        _candidate("cand_0", 85.0, 100),
+        _candidate("cand_1", 85.0, 100),
+    ]
+    # Identical accuracy AND code size -> first by list order wins.
+    assert select_best(candidates).name == "cand_0"
+
+
+def test_select_best_ranks_scored_above_none_accuracy():
+    from sia.orchestrator import select_best
+
+    candidates = [
+        _candidate("cand_0", None, 50),
+        _candidate("cand_1", 60.0, 400),
+        _candidate("cand_2", None, 10),
+    ]
+    assert select_best(candidates).name == "cand_1"
+
+
+def test_select_best_all_none_returns_first_without_crash():
+    from sia.orchestrator import select_best
+
+    candidates = [
+        _candidate("cand_0", None, 200),
+        _candidate("cand_1", None, 50),
+    ]
+    # No parseable accuracy anywhere -> defined fallback to the first candidate.
+    assert select_best(candidates).name == "cand_0"
+
+
+def test_select_best_single_candidate_returns_it():
+    from sia.orchestrator import select_best
+
+    only = _candidate("cand_0", 42.0, 999)
+    assert select_best([only]).name == "cand_0"
+
+
+def test_select_best_accepts_forward_compatible_minibatch_frac():
+    from sia.orchestrator import select_best
+
+    candidates = [
+        _candidate("cand_0", 70.0, 100),
+        _candidate("cand_1", 90.0, 100),
+    ]
+    # The signature reserves minibatch_frac for a later follow-up; passing it
+    # must not change v1 full-eval argmax behavior.
+    assert select_best(candidates, minibatch_frac=None).name == "cand_1"
