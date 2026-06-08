@@ -71,6 +71,7 @@ __all__ = [
     "TaskFiles",
     "build_feedback_prompt",
     "build_meta_prompt",
+    "compute_protected_paths",
     "load_agent_execution",
     "load_task_files",
     "main",
@@ -86,6 +87,19 @@ logger = get_logger(__name__)
 # ========================
 # HELPER FUNCTIONS
 # ========================
+
+
+def compute_protected_paths(task_dir: str) -> list[str]:
+    """Return the task's held-out ground-truth dirs that meta/feedback agents must not read.
+
+    Generic across all SIA tasks: the public/private convention places grader-only ground
+    truth under ``<task_dir>/data/private``. Returns the absolute path when that dir exists,
+    or an empty list (no-op) when the task ships no private dir.
+    """
+    private_dir = os.path.join(task_dir, "data/private")
+    if os.path.isdir(private_dir):
+        return [os.path.abspath(private_dir)]
+    return []
 
 
 def load_agent_execution(gen_directory, config: Config | None = None):
@@ -617,6 +631,9 @@ def _run_feedback_agent(
     write_text(feedback_prompt_path, feedback_agent_prompt)
     logger.info(f"  ✓ Saved feedback agent prompt to: {feedback_prompt_path}")
 
+    # dataset_dir is <task_dir>/data/public; the held-out dir is its sibling data/private.
+    task_dir = os.path.dirname(os.path.dirname(dataset_dir))
+
     asyncio.run(
         run_agent(
             model_name=meta_profile.model,
@@ -625,6 +642,7 @@ def _run_feedback_agent(
             agent_working_directory=next_gen_dir,
             agent_impl=meta_profile.agent_impl,
             provider=meta_profile.provider,
+            protected_paths=compute_protected_paths(task_dir),
         )
     )
 
@@ -909,6 +927,7 @@ def main():
             agent_working_directory=run_setup.meta_agent_working_directory,
             agent_impl=agent_impl,
             provider=meta_profile.provider,
+            protected_paths=compute_protected_paths(task_dir),
         )
     )
 
